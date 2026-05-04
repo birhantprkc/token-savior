@@ -204,21 +204,68 @@ def run_migrations(db_path: Path | str | None = None) -> None:
         )
 
         # A1-1: create the vec0 virtual table when sqlite-vec is loadable.
-        # FLOAT[384] matches the SentenceTransformer("all-MiniLM-L6-v2")
-        # output used by memory/embeddings.py. Creation is gated on the
-        # extension being loaded — otherwise silently skipped.
+        # FLOAT[768] matches the FastEmbed nomic-embed-text-v1.5-Q output
+        # used by memory/embeddings.py. If a legacy FLOAT[384] table is
+        # present from a pre-2.8 install, drop it so the new schema can be
+        # created — vectors are rebuilt on demand by backfill_obs_vectors.
         if _maybe_load_sqlite_vec(conn):
             try:
+                row = conn.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type='table' AND name='obs_vectors'"
+                ).fetchone()
+                if row and "FLOAT[384]" in (row[0] or ""):
+                    _logger.warning(
+                        "[token-savior:memory] legacy FLOAT[384] obs_vectors "
+                        "detected; dropping to rebuild in FLOAT[768].",
+                    )
+                    conn.execute("DROP TABLE obs_vectors")
                 conn.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS obs_vectors USING vec0("
                     "  obs_id INTEGER PRIMARY KEY,"
-                    "  embedding FLOAT[384]"
+                    "  embedding FLOAT[768]"
                     ")"
                 )
             except sqlite3.OperationalError as exc:
                 _logger.warning(
                     "[token-savior:memory] obs_vectors create failed (%s); "
                     "vector search disabled.", exc,
+                )
+
+            # Feature 1: symbol-level vector index for search_codebase(semantic=True).
+            # vec0 demands INTEGER primary keys and a dense FLOAT[N] column, so
+            # symbol metadata (project + key) lives in a sibling mapping table
+            # and the vec row is joined via symbol_id.
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS symbols("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  project_root TEXT NOT NULL,"
+                    "  symbol_key TEXT NOT NULL,"
+                    "  file_path TEXT NOT NULL,"
+                    "  lineno INTEGER NOT NULL,"
+                    "  kind TEXT NOT NULL,"
+                    "  signature TEXT,"
+                    "  docstring_head TEXT,"
+                    "  content_hash TEXT NOT NULL,"
+                    "  updated_at_epoch INTEGER NOT NULL,"
+                    "  UNIQUE(project_root, symbol_key)"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_symbols_proj "
+                    "ON symbols(project_root)"
+                )
+                conn.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS symbol_vectors USING vec0("
+                    "  symbol_id INTEGER PRIMARY KEY,"
+                    "  embedding FLOAT[768]"
+                    ")"
+                )
+            except sqlite3.OperationalError as exc:
+                _logger.warning(
+                    "[token-savior:memory] symbol_vectors create failed (%s); "
+                    "semantic code search disabled.", exc,
                 )
 
         conn.commit()

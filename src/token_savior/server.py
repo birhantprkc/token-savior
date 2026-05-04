@@ -21,9 +21,7 @@ graph pollution, no shared RAM between unrelated projects.
     "What does X call?"                -> get_dependencies(X)
     "Impact of changing X"             -> get_change_impact(X)
     "Orient me on X (source+callers)"  -> get_full_context(X)
-    "Find Y in code, want symbol ctx"  -> search_in_symbols(pattern=Y)
     "Raw regex grep"                   -> search_codebase(pattern=Y)
-    "Audit this file"                  -> audit_file(file_path=F)
     "Dead / unused code"               -> find_dead_code
     "Complexity hotspots"              -> find_hotspots (T0=most actionable)
     "Breaking API changes"             -> detect_breaking_changes (T0=breaking)
@@ -45,6 +43,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from typing import Any
 
@@ -63,6 +62,7 @@ from token_savior.server_handlers import (
 from token_savior.server_handlers.code_nav import (
     _q_get_edit_context,  # noqa: F401  -- re-export for tests/test_server.py
 )
+from token_savior.server_handlers.tool_search import ts_search as _ts_search_impl
 from token_savior.server_handlers.stats import (
     _format_duration,  # noqa: F401  -- re-export for tests/test_usage_stats.py
     _format_usage_stats,  # noqa: F401  -- re-export for tests/test_usage_stats.py
@@ -114,42 +114,124 @@ TOOLS = [Tool(name=name, description=s["description"], inputSchema=s["inputSchem
 # `lean` = aggressively trimmed profile for agent sessions that don't need
 # the memory/reasoning/ML-stats machinery. Keeps the full surface of code
 # navigation, editing, git, checkpoints, tests, and config/docker analysis.
-# Cuts manifest from ~10 950 tokens (full 106 tools) to ~5 500 tokens.
+# Manifest math measured 2026-04-23:
+#   full (94 tools)  = 14 159 est. tokens
+#   lean (61 tools)  =  10 507 est. tokens  (-26 %, narrowly above
+#                                              Claude Code's 10k
+#                                              auto-defer threshold —
+#                                              Spike 2 USE WHEN/NOT WHEN
+#                                              rewrite should bring it
+#                                              under on net)
+#   ultra (17 + 1)   =   3 540 est. tokens  (-75 %)
+#
+# `lean` post-spike-1 keeps 3 tools that the pure call-volume cut would
+# have dropped: `memory_save` (the user-facing "remember this across
+# sessions" contract — dropping silently breaks README's "nothing
+# forgotten" promise) and the atomic pair `discover_project_actions` +
+# `run_project_action` (5/3330 calls on VPS, but the workflow needs
+# both or none).
 _LEAN_EXCLUDES: set[str] = {
-    # Memory engine (26 tools) — opt-in only
-    "memory_save", "memory_search", "memory_get", "memory_index",
-    "memory_delete", "memory_top", "memory_why", "memory_timeline",
-    "memory_session_history", "memory_prompts", "memory_mode",
-    "memory_archive", "memory_status", "memory_bus_push", "memory_bus_list",
-    "memory_consistency", "memory_quarantine_list", "memory_maintain",
-    "memory_doctor", "memory_vector_reindex", "memory_distill",
-    "memory_dedup_sweep", "memory_roi_gc", "memory_roi_stats",
-    "memory_from_bash", "memory_set_global",
-    # Reasoning (3) — memory-adjacent
+    # Memory engine — opt-in only. memory_save / memory_index / memory_search
+    # / memory_get / memory_delete are user-facing and stay visible.
+    # memory_admin is a new fusion (Round 5) replacing 21 admin tools that
+    # were previously listed here individually.
+    "memory_search", "memory_get", "memory_index",
+    "memory_delete", "memory_admin",
+    # Reasoning — memory-adjacent, 0 calls in tsbench + VPS
     "reasoning_save", "reasoning_search", "reasoning_list",
-    # (stats fused into single get_stats tool — kept in lean since usage stats
-    # are useful; ML subsystem categories are opt-in via category=)
-    # Corpus / discover actions (4)
+    # Corpus — 0 calls in tsbench + VPS
     "corpus_build", "corpus_query",
-    "discover_project_actions", "run_project_action",
-    # Niche analysis — edge cases, rare in practice
-    "get_duplicate_classes", "get_call_predictions",
-    "pack_context",
+    # search_in_symbols is a subset of search_codebase — kept registered
+    # for backwards compatibility but excluded from lean.
+    "search_in_symbols",
+    # Tool capture — agent never invokes capture_put/purge directly
+    # (hook handles that). capture_get + capture_search were initially
+    # kept visible for post-compaction retrieval, but tsbench-26/04 showed
+    # the agent invoking capture_get to re-fetch outputs > threshold,
+    # injecting 5-30 KB back into context (cache_creation +40k on TASK-039).
+    # The capture sandbox saves nothing if the agent re-pulls everything.
+    # All capture_* tools are now lean-excluded; opt-in via TS_CAPTURE_VISIBLE=1.
+    "capture_put", "capture_purge", "capture_aggregate", "capture_list",
+    "capture_get", "capture_search",
+    # (discover_project_actions + run_project_action kept atomically —
+    #  low volume but paired workflow would break if split.)
 }
 
-# `ultra` = minimal manifest with lazy tool discovery. Only 17 hot tools +
-# a single `ts_extended` proxy exposed. LLM reaches the rest via
-# ts_extended(mode="list" | "describe" | "call"). Cuts manifest from
-# ~10 950 tokens (full 106) to ~2 800 tokens. Tradeoff: invoking a hidden
-# tool costs an extra round trip unless the LLM already knows its name.
+# `ultra` = minimal manifest with lazy tool discovery. Curated list of
+# tools that prod 30 d audit shows as ≥3 calls or strategically critical.
+# LLM reaches the rest via ts_extended(mode="list" | "describe" | "call").
+# Tradeoff: invoking a hidden tool costs an extra round trip.
+#
+# Manifest math measured 2026-04-25 (post Round 3 + Round 5):
+#   full       (66) ~ 8 969 tokens
+#   lean       (51) ~ 7 052
+#   lean+memdis(50) ~ 6 740
+#   ultra      (28) ~ 3 800     (-43 % vs lean+memdis, -57 % vs full)
+#
+# Expanded from the 17-tool baseline by ~11 tools that the 30 d production
+# audit identified as moderately used (find_dead_code 18 calls,
+# find_hotspots 17, get_imports 49, get_routes 15, etc.). Adding them
+# preserves the mental model "main tools always reachable" while keeping
+# the manifest under the 4k-token threshold where Claude Code stops
+# auto-deferring.
 _ULTRA_INCLUDES: set[str] = {
-    "switch_project", "list_projects", "reindex",
+    # Project lifecycle (5)
+    "switch_project", "set_project_root", "list_projects", "reindex",
+    "get_project_summary",
+    # Code navigation core (8)
     "search_codebase", "list_files",
     "get_function_source", "get_class_source", "find_symbol",
     "get_full_context", "get_structure_summary",
-    "get_functions", "get_dependencies", "get_dependents",
-    "get_file_dependents", "analyze_config",
-    "replace_symbol_source", "insert_near_symbol",
+    "get_functions", "get_imports",
+    # Dependency graph (3)
+    "get_dependencies", "get_dependents", "get_file_dependents",
+    # Edit primitives (4)
+    "replace_symbol_source", "insert_near_symbol", "edit_lines_in_symbol",
+    "add_field_to_model",
+    # Analysis (5)
+    "analyze_config", "analyze_docker", "find_dead_code",
+    "find_hotspots", "find_semantic_duplicates", "detect_breaking_changes",
+    # Git (2)
+    "get_git_status", "get_changed_symbols",
+    # Routes (1)
+    "get_routes",
+    # Memory user-facing (1)
+    "memory_save",
+    # Tool capture (2 — read-side only, hook does the writes)
+    "capture_get", "capture_search",
+}
+
+# `tiny` = thin manifest with deferred-loading router. Exposes only 5 hot
+# tools + ts_search. Other tools reachable via ts_search(query=...) which
+# returns top-K matched schemas (Nomic embeddings on tool descriptions).
+# Mirrors the Tool Attention paper (arxiv 2604.21816, -95% prefix on 120
+# tools). One extra round-trip per turn for non-hot tools, but breaks
+# even after ~3 cold-start agent turns. Manifest math 2026-04-26:
+#   tiny  ( 6 tools)  ~  1 500 tokens  (-78 % vs lean post-cleanup)
+_TINY_INCLUDES: set[str] = {
+    "switch_project",
+    "find_symbol",
+    "get_function_source",
+    "get_full_context",
+    "search_codebase",
+    "ts_search",
+}
+
+# `tiny_plus` = tiny + 9 tools that bench 26/04 showed agents abandon when
+# missing or workaround poorly. Covers nav (entry points), audit (dead-code,
+# semantic duplicates), graph (call chain), config (analyze_config), git
+# (status + breaking changes), and edit primitives (replace_symbol_source,
+# add_field_to_model). Manifest ~2.5 KT (vs tiny ~1.1 KT, lean ~7 KT).
+_TINY_PLUS_INCLUDES: set[str] = _TINY_INCLUDES | {
+    "find_dead_code",
+    "find_semantic_duplicates",
+    "get_call_chain",
+    "get_entry_points",
+    "analyze_config",
+    "get_git_status",
+    "detect_breaking_changes",
+    "add_field_to_model",
+    "replace_symbol_source",
 }
 
 _PROFILE_EXCLUDES: dict[str, set[str]] = {
@@ -158,6 +240,8 @@ _PROFILE_EXCLUDES: dict[str, set[str]] = {
     "nav":  set(_MEMORY_HANDLERS) | set(_META_HANDLERS) | set(_SLOT_HANDLERS),
     "lean": _LEAN_EXCLUDES,
     "ultra": set(TOOL_SCHEMAS) - _ULTRA_INCLUDES,
+    "tiny": set(TOOL_SCHEMAS) - _TINY_INCLUDES,
+    "tiny_plus": set(TOOL_SCHEMAS) - _TINY_PLUS_INCLUDES,
 }
 
 _PROFILE = os.environ.get("TOKEN_SAVIOR_PROFILE", "full").lower()
@@ -173,6 +257,33 @@ _HIDDEN_UNDER_ULTRA: set[str] = _PROFILE_EXCLUDES["ultra"]
 if _PROFILE != "full":
     _excluded = _PROFILE_EXCLUDES[_PROFILE]
     TOOLS = [t for t in TOOLS if t.name not in _excluded]
+
+# When memory is disabled at runtime (e.g. bench subprocess) hide the
+# remaining memory entrypoints from the manifest — every advertised tool
+# costs ~50-100 tokens whether it's used or not.
+if os.environ.get("TS_MEMORY_DISABLE") == "1":
+    _MEMORY_GATED = {
+        "memory_save", "memory_index", "memory_search", "memory_get",
+        "memory_delete", "memory_admin",
+        "reasoning_save", "reasoning_search", "reasoning_list",
+        "corpus_build", "corpus_query",
+    }
+    TOOLS = [t for t in TOOLS if t.name not in _MEMORY_GATED]
+
+# When tool-capture sandboxing is disabled (TS_CAPTURE_DISABLED=1) the
+# capture_* tools always return empty payloads but the agent still
+# discovers them in the manifest and burns turns calling capture_search /
+# capture_get on stale or empty rows. Drop the read-side capture tools
+# from the manifest in that mode (the write-side ones — capture_put,
+# capture_purge — are already lean-excluded; only capture_get and
+# capture_search remain, and both become useless when nothing is captured).
+if os.environ.get("TS_CAPTURE_DISABLED") == "1":
+    _CAPTURE_GATED = {
+        "capture_get", "capture_search",
+        "capture_aggregate", "capture_list",
+        "capture_put", "capture_purge",
+    }
+    TOOLS = [t for t in TOOLS if t.name not in _CAPTURE_GATED]
 
 if _PROFILE == "ultra":
     _hidden_catalog = ", ".join(sorted(_HIDDEN_UNDER_ULTRA))
@@ -212,6 +323,16 @@ print(
     file=sys.stderr,
 )
 
+# Default stays at 'full' (66 tools, ~9k tokens). Token-conscious users
+# can opt down via TOKEN_SAVIOR_PROFILE=lean (51 tools), =ultra (33 hot
+# tools + ts_extended proxy, ~5k tokens), =core, or =nav.
+if "TOKEN_SAVIOR_PROFILE" not in os.environ and _PROFILE == "full":
+    print(
+        "[token-savior] profile=full (66 tools). Set TOKEN_SAVIOR_PROFILE=lean "
+        "or =ultra to reduce manifest cost.",
+        file=sys.stderr,
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +366,13 @@ def _track_call(name: str, arguments: dict[str, Any]) -> str:
             s._auto_save_tools.append(name)
 
     s._tool_call_counts[name] = s._tool_call_counts.get(name, 0) + 1
+    # A5: persistent scoped-by-client counter for profile tuning across
+    # sessions. Silent on failure — telemetry must never break dispatch.
+    try:
+        from token_savior import telemetry
+        telemetry.record_tool_call(name)
+    except Exception:
+        pass
     record_symbol = arguments.get("name") or arguments.get("symbol_name", "")
     try:
         s._prefetcher.record_call(name, record_symbol or "")
@@ -383,6 +511,25 @@ def _dispatch_tool(name: str, arguments: dict[str, Any], record_symbol: str) -> 
     return [TextContent(type="text", text=f"Error: unknown tool '{name}'")]
 
 
+def _handle_ts_search(arguments: dict[str, Any]) -> list[types.TextContent]:
+    """Defer-loading router: cosine-sim over Nomic tool description embeddings.
+
+    Restricts scoring to currently-visible tools (honors profile + env gates)
+    so a `tiny`-profile session sees `ts_search` reach back into the ~60
+    hidden tools but cannot suggest something that's been intentionally
+    excluded (e.g. capture_* under TS_CAPTURE_DISABLED=1).
+    """
+    import json as _json
+    visible = {t.name for t in TOOLS}
+    payload = _ts_search_impl(
+        arguments.get("query") or "",
+        top_k=arguments.get("top_k", 5),
+        include_schema=arguments.get("include_schema", True),
+        visible_tools=visible,
+    )
+    return [TextContent(type="text", text=_json.dumps(payload, indent=2))]
+
+
 def _handle_ts_extended(arguments: dict[str, Any]) -> list[types.TextContent]:
     """Proxy for tools hidden under the `ultra` profile.
 
@@ -428,16 +575,45 @@ def _handle_ts_extended(arguments: dict[str, Any]) -> list[types.TextContent]:
     )]
 
 
+# Request lifecycle logging is opt-in via TOKEN_SAVIOR_TRACE=1.
+# Issue #27: gives operators (especially on Windows where MCP requests
+# can hang or abort) a way to see start / dispatch / complete events
+# without enabling the full debug logger.
+_TRACE_REQUESTS = os.environ.get("TOKEN_SAVIOR_TRACE", "").lower() in ("1", "true", "yes")
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+
+    start = time.monotonic() if _TRACE_REQUESTS else 0.0
+    if _TRACE_REQUESTS:
+        print(f"[token-savior] -> call {name}", file=sys.stderr, flush=True)
 
     record_symbol = _track_call(name, arguments)
     try:
         if name == "ts_extended":
-            return _handle_ts_extended(arguments)
-        return _dispatch_tool(name, arguments, record_symbol)
+            result = _handle_ts_extended(arguments)
+        elif name == "ts_search":
+            result = _handle_ts_search(arguments)
+        else:
+            result = _dispatch_tool(name, arguments, record_symbol)
+        if _TRACE_REQUESTS:
+            elapsed_ms = (time.monotonic() - start) * 1000.0
+            print(
+                f"[token-savior] <- ok   {name} ({elapsed_ms:.0f}ms)",
+                file=sys.stderr,
+                flush=True,
+            )
+        return result
 
     except Exception as e:
+        if _TRACE_REQUESTS:
+            elapsed_ms = (time.monotonic() - start) * 1000.0
+            print(
+                f"[token-savior] <- err  {name} ({elapsed_ms:.0f}ms) {type(e).__name__}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
         print(f"[token-savior] Error in {name}: {traceback.format_exc()}", file=sys.stderr)
         return [TextContent(type="text", text=f"Error: {e}")]
 
@@ -448,8 +624,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
 
 
 async def main():
+    if _TRACE_REQUESTS:
+        print("[token-savior] startup: running memory migrations", file=sys.stderr, flush=True)
     memory_db.run_migrations()
+    if _TRACE_REQUESTS:
+        print("[token-savior] startup: opening stdio transport", file=sys.stderr, flush=True)
     async with stdio_server() as (read_stream, write_stream):
+        if _TRACE_REQUESTS:
+            print("[token-savior] startup: server.run loop entered", file=sys.stderr, flush=True)
         await server.run(
             read_stream,
             write_stream,

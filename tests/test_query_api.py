@@ -1044,7 +1044,13 @@ class TestProjectQueryFunctions:
 
     def test_get_file_dependents_not_found(self):
         deps = self.funcs["get_file_dependents"]("nonexistent.py")
-        assert "Error" in deps[0]
+        # Error response is now a structured dict (was a bare string).
+        # Check the rich shape so the agent gets a useful "did you mean"
+        # plus a "run reindex" hint instead of a one-liner.
+        assert isinstance(deps[0], dict)
+        assert "error" in deps[0]
+        assert "nonexistent.py" in deps[0]["error"]
+        assert "hint" in deps[0]
 
     def test_search_codebase(self):
         results = self.funcs["search_codebase"]("class ")
@@ -1110,11 +1116,25 @@ class TestOutputSizeControls:
         self.index = _make_project_index()
         self.funcs = create_project_query_functions(self.index)
 
+    @staticmethod
+    def _data_rows(result):
+        """Strip trailing control markers (`_truncated`, `_hints`, `_empty`)."""
+        return [
+            r for r in result
+            if not (isinstance(r, dict) and any(k.startswith("_") for k in r))
+        ]
+
     def test_get_functions_max_results(self):
+        # Default cap (A2) is 100; the fixture has 6 functions so the
+        # cap is not hit and the shape matches the old unlimited contract.
         all_funcs = self.funcs["get_functions"]()
         assert len(all_funcs) == 6
         limited = self.funcs["get_functions"](max_results=2)
-        assert len(limited) == 2
+        # Truncation adds one `_truncated` marker after the data rows.
+        assert len(self._data_rows(limited)) == 2
+        assert any(
+            isinstance(r, dict) and r.get("_truncated") is True for r in limited
+        )
 
     def test_get_functions_max_results_zero_unlimited(self):
         result = self.funcs["get_functions"](max_results=0)
@@ -1122,13 +1142,19 @@ class TestOutputSizeControls:
 
     def test_get_classes_max_results(self):
         limited = self.funcs["get_classes"](max_results=1)
-        assert len(limited) == 1
+        assert len(self._data_rows(limited)) == 1
+        assert any(
+            isinstance(r, dict) and r.get("_truncated") is True for r in limited
+        )
 
     def test_get_imports_max_results(self):
         all_imports = self.funcs["get_imports"]()
         assert len(all_imports) == 3
         limited = self.funcs["get_imports"](max_results=2)
-        assert len(limited) == 2
+        assert len(self._data_rows(limited)) == 2
+        assert any(
+            isinstance(r, dict) and r.get("_truncated") is True for r in limited
+        )
 
     def test_list_files_max_results(self):
         all_files = self.funcs["list_files"]()

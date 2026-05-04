@@ -29,11 +29,14 @@ _NAMES_PARAM = {
 TOOL_SCHEMAS: dict[str, dict] = {
     # ── Meta tools ────────────────────────────────────────────────────────
     "list_projects": {
-        "description": "List all registered workspace projects with their index status.",
+        "description": (
+        'List all registered workspace projects with index status.'   ),
         "inputSchema": {"type": "object", "properties": {}},
     },
     "switch_project": {
-        "description": "Switch the active project. Subsequent tool calls without explicit project target this project.",
+        "description": (
+        'Switch the active project.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -47,15 +50,13 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     # ── Git & diff ────────────────────────────────────────────────────────
     "get_git_status": {
-        "description": "Return a structured git status summary for the active project: branch, ahead/behind, staged, unstaged, and untracked files.",
+        "description": (
+        'Structured git status: branch, ahead/behind, staged, unstaged, untracked.'   ),
         "inputSchema": {"type": "object", "properties": {**_PROJECT_PARAM}},
     },
     "get_changed_symbols": {
         "description": (
-            "Symbol-level summary of changes (worktree, or HEAD vs ref). "
-            "For PR/commit-message tasks prefer build_commit_summary which is tuned "
-            "to produce a compact narrative with stats, hotspots, and suggested type."
-        ),
+        'Symbol-level summary of worktree changes (or HEAD vs ref).' ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -66,20 +67,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
             },
         },
     },
-    "summarize_patch_by_symbol": {
-        "description": "Symbol-level summary of changed files (compact review vs diff).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "changed_files": {"type": "array", "items": {"type": "string"}},
-                "max_files": {"type": "integer", "description": "Default 20."},
-                "max_symbols_per_file": {"type": "integer", "description": "Default 20."},
-                **_PROJECT_PARAM,
-            },
-        },
-    },
     "build_commit_summary": {
-        "description": "Symbol-level commit/review summary (vs textual diffs).",
+        "description": (
+        'Compact commit/review narrative with stats, hotspots, suggested type.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -94,15 +84,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     # ── Checkpoints (unified) ─────────────────────────────────────────────
     "checkpoint": {
         "description": (
-            "Unified checkpoint CRUD. Pass op to select:\n"
-            "  - create: snapshot a bounded set of files (requires file_paths)\n"
-            "  - list (default): list available checkpoints for active project\n"
-            "  - restore: revert files from a checkpoint (requires checkpoint_id)\n"
-            "  - delete: remove one checkpoint (requires checkpoint_id)\n"
-            "  - prune: keep only the newest N checkpoints (keep_last, default 10)\n"
-            "  - compare: symbol-level diff of a checkpoint vs current files "
-            "(requires checkpoint_id)"
-        ),
+        'Unified checkpoint CRUD. op = create | list (default) | restore | delete | prune | compare.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -134,7 +116,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     # ── Structural edits ──────────────────────────────────────────────────
     "replace_symbol_source": {
-        "description": "Replace an indexed symbol's full source block directly, without sending a file-wide patch.",
+        "description": (
+        "Replace an indexed symbol's full source block directly."
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -155,8 +139,25 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": ["symbol_name", "new_source"],
         },
     },
+    "edit_lines_in_symbol": {
+        "description": "Exact string-replace inside an indexed symbol's body (like Edit but symbol-scoped, no Read first needed).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "symbol_name": {"type": "string", "description": "Function/method/class name to edit inside."},
+                "old_string": {"type": "string", "description": "Exact text to find inside the symbol body (must be unique within the symbol unless replace_all=true)."},
+                "new_string": {"type": "string", "description": "Replacement text."},
+                "file_path": {"type": "string", "description": "Optional file path to disambiguate symbols."},
+                "replace_all": {"type": "boolean", "description": "If true, replace every occurrence in the symbol body (default false)."},
+                **_PROJECT_PARAM,
+            },
+            "required": ["symbol_name", "old_string", "new_string"],
+        },
+    },
     "insert_near_symbol": {
-        "description": "Insert content before/after an indexed symbol.",
+        "description": (
+        'Insert content before or after an indexed symbol.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -170,7 +171,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "move_symbol": {
-        "description": "Move a symbol (function/class) to a different file. Updates imports in all call sites. Returns {from_file, to_file, symbol, updated_imports}.",
+        "description": (
+        'Move a symbol to a different file, updating imports in all call sites.' ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -183,7 +185,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "add_field_to_model": {
-        "description": "Add a field to a model/class/interface. Supports .prisma, .py (dataclass/SQLAlchemy), .ts/.tsx (interface/type).",
+        "description": (
+        'Add a field to a model/class/interface. Supports .prisma, .py (dataclass, SQLAlchemy), .ts/.tsx.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -197,39 +200,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": ["model", "field_name", "field_type"],
         },
     },
-    "apply_refactoring": {
-        "description": "Unified refactoring: rename, move, add_field, or extract. "
-                       "Type 'rename': {symbol, new_name}. "
-                       "Type 'move': {symbol, target_file}. "
-                       "Type 'add_field': {model, field_name, field_type}. "
-                       "Type 'extract': {file_path, start_line, end_line, new_name}.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "type": {
-                    "type": "string",
-                    "enum": ["rename", "move", "add_field", "extract"],
-                    "description": "Refactoring operation type.",
-                },
-                "symbol": {"type": "string", "description": "Symbol name (rename/move)."},
-                "new_name": {"type": "string", "description": "New name (rename/extract)."},
-                "target_file": {"type": "string", "description": "Target file (move)."},
-                "create_if_missing": {"type": "boolean", "description": "Create target if missing (move, default true)."},
-                "model": {"type": "string", "description": "Model name (add_field)."},
-                "field_name": {"type": "string", "description": "Field name (add_field)."},
-                "field_type": {"type": "string", "description": "Field type (add_field)."},
-                "file_path": {"type": "string", "description": "File path (extract/add_field)."},
-                "after": {"type": "string", "description": "Insert after (add_field)."},
-                "start_line": {"type": "integer", "description": "Start line (extract)."},
-                "end_line": {"type": "integer", "description": "End line (extract)."},
-                **_PROJECT_PARAM,
-            },
-            "required": ["type"],
-        },
-    },
     # ── Tests & validation ────────────────────────────────────────────────
     "find_impacted_test_files": {
-        "description": "Infer a compact set of likely impacted pytest files from changed files or symbols.",
+        "description": (
+        'Infer pytest files likely impacted by changed files or symbols.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -241,7 +215,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "run_impacted_tests": {
-        "description": "Run tests impacted by current changes.",
+        "description": (
+        'Run pytest on files impacted by the current worktree changes.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -256,32 +231,15 @@ TOOL_SCHEMAS: dict[str, dict] = {
             },
         },
     },
-    "apply_symbol_change_and_validate": {
-        "description": "Replace symbol source, reindex, run tests.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "symbol_name": {"type": "string"},
-                "new_source": {"type": "string"},
-                "file_path": {"type": "string"},
-                "rollback_on_failure": {"type": "boolean"},
-                "max_tests": {"type": "integer"},
-                "timeout_sec": {"type": "integer"},
-                "max_output_chars": {"type": "integer"},
-                "include_output": {"type": "boolean"},
-                "compact": {"type": "boolean"},
-                **_PROJECT_PARAM,
-            },
-            "required": ["symbol_name", "new_source"],
-        },
-    },
     # ── Project actions ───────────────────────────────────────────────────
     "discover_project_actions": {
-        "description": "Detect conventional project actions from build files (tests, lint, build, run) without executing them.",
+        "description": (
+        'Detect conventional project actions from build files (tests, lint, build, run) without executing.'   ),
         "inputSchema": {"type": "object", "properties": {**_PROJECT_PARAM}},
     },
     "run_project_action": {
-        "description": "Run a discovered project action by id (bounded output/timeout).",
+        "description": (
+        'Run a discovered project action by id (bounded output, bounded timeout).'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -296,11 +254,13 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     # ── Query tools ───────────────────────────────────────────────────────
     "get_project_summary": {
-        "description": "High-level overview of the project: file count, packages, top classes/functions.",
+        "description": (
+        'Project overview: file count, packages, top classes/functions, infra dirs.'   ),
         "inputSchema": {"type": "object", "properties": {**_PROJECT_PARAM}},
     },
     "list_files": {
-        "description": "List indexed files. Optional glob pattern to filter (e.g. '*.py', 'src/**/*.ts').",
+        "description": (
+        'List indexed files, optionally filtered by glob.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -317,7 +277,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "get_structure_summary": {
-        "description": "Structure summary for a file (functions, classes, imports, line counts) or the whole project if no file specified.",
+        "description": (
+        'Structure of one file (functions, classes, imports, line counts), or project-wide if file omitted.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -330,7 +291,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "get_function_source": {
-        "description": "Get a function/method source. `level`: 0 full, 1 sig+doc, 2 summary, 3 one-liner. Batch: pass `names` (max 10) instead of `name` to get multiple in one call.",
+        "description": (
+        'Fetch a function/method source body.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -346,7 +308,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "get_class_source": {
-        "description": "Get a class source. `level`: 0 full, 1 sig+doc, 2 summary, 3 one-liner. Batch: pass `names` (max 10) instead of `name` to get multiple in one call.",
+        "description": (
+        'Fetch a class source body (including methods).'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -363,15 +327,12 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "get_functions": {
         "description": (
-            "List functions (name, lines, params, file). Preferred tool for "
-            "\"list all functions of file X\" (pass `file_path=...`) or a project-wide enumeration. "
-            "Trailing `_hints` entry suggests next tool calls (disable with hints=false)."
-        ),
+        'List functions in a file (file_path=...) or across the project.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Filter to file (omit=all)."},
-                "max_results": {"type": "integer", "description": "0=unlimited."},
+                "max_results": {"type": "integer", "description": "Default 100. 0=unlimited. Truncated results carry a trailing `_truncated` marker with total count."},
                 "hints": {"type": "boolean", "description": "Append a `_hints` entry with next-step tool calls (default true)."},
                 **_COMPRESS_PARAM,
                 **_PROJECT_PARAM,
@@ -379,12 +340,13 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "get_classes": {
-        "description": "List classes (name, lines, methods, bases, file). Trailing `_hints` entry suggests next tool calls (disable with hints=false).",
+        "description": (
+        'List classes (name, lines, methods, bases, file).'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Filter to file (omit=all)."},
-                "max_results": {"type": "integer", "description": "0=unlimited."},
+                "max_results": {"type": "integer", "description": "Default 100. 0=unlimited. Truncated results carry a trailing `_truncated` marker with total count."},
                 "hints": {"type": "boolean", "description": "Append a `_hints` entry with next-step tool calls (default true)."},
                 **_COMPRESS_PARAM,
                 **_PROJECT_PARAM,
@@ -392,14 +354,15 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "get_imports": {
-        "description": "List imports (module, names, line).",
+        "description": (
+        'List imports (module, names, line).'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Filter to file (omit=all)."},
                 "max_results": {
                     "type": "integer",
-                    "description": "0=unlimited.",
+                    "description": "Default 100. 0=unlimited. Truncated results carry a trailing `_truncated` marker with total count.",
                 },
                 **_COMPRESS_PARAM,
                 **_PROJECT_PARAM,
@@ -407,7 +370,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "find_symbol": {
-        "description": "Locate a symbol (file, line, signature, preview). `level`: 0 full, 1 no source_preview, 2 minimal {name, file, line, type}. Batch: pass `names` (max 10) instead of `name`.",
+        "description": (
+        'Locate a symbol: file, line, signature, minimal preview.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -427,15 +391,12 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "get_dependencies": {
         "description": (
-            "Symbols called/used by this symbol. Pass depth>1 to walk the call "
-            "chain transitively (BFS) — saves N round trips when tracing a chain "
-            "X→Y→Z→... in one shot. Each hop is tagged with `depth` and `from`."
-        ),
+        'Outgoing deps of a symbol: what X calls/uses (downstream).' ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string"},
-                "max_results": {"type": "integer", "description": "0=unlimited."},
+                "max_results": {"type": "integer", "description": "Default 100. 0=unlimited. Truncated results carry a trailing `_truncated` marker with total count."},
                 "depth": {"type": "integer", "description": "Transitive BFS depth (default 1)."},
                 **_COMPRESS_PARAM,
                 **_PROJECT_PARAM,
@@ -444,7 +405,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "get_dependents": {
-        "description": "Symbols that reference this function/class.",
+        "description": (
+        'Incoming deps: who calls/uses X, direct references only.' ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -458,7 +420,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "get_change_impact": {
-        "description": "Impact of changing a symbol: direct + transitive dependents with confidence/depth.",
+        "description": (
+        'Impact analysis: direct + transitive dependents of a symbol.' ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -473,9 +436,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "get_full_context": {
         "description": (
-            "Symbol: location + source + deps/dependents (depth=1) or + change_impact (depth=2). "
-            "BATCH: pass `names=[...]` (max 10) for 2+ symbols. `brief=true` for tighter deps."
-        ),
+        'Symbol bundle: location + source + deps/dependents (depth=1) or + change_impact (depth=2).' ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -498,7 +459,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "get_call_chain": {
-        "description": "Find the shortest dependency path between two symbols (BFS through the dependency graph).",
+        "description": (
+        'Shortest dependency path between two symbols (BFS through the dep graph).'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -522,7 +484,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "get_edit_context": {
-        "description": "Symbol source + direct deps + callers + siblings + impacted tests in one call. Returns {symbol, source, location, dependencies, callers, siblings, impacted_tests}.",
+        "description": (
+        'Pre-edit bundle: source + direct deps + callers + same-file siblings + impacted tests.' ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -535,7 +498,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "get_file_dependencies": {
-        "description": "List files that this file imports from (file-level import graph).",
+        "description": (
+        'Files imported by this file (outgoing file-level import edges).'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -554,9 +518,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "get_file_dependents": {
         "description": (
-            "Files that import from this file (reverse import graph). "
-            "USE THIS instead of search_codebase('import X') for 'who depends on this module'."
-        ),
+        'Files that import this file (incoming file-level import edges).'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -575,16 +537,17 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "search_codebase": {
         "description": (
-            "Regex search across indexed files (100 matches max). Skips generated/minified "
-            "(ignore_generated=false to include). Symbol lookup: find_symbol. "
-            "Content + enclosing symbol: search_in_symbols."
-        ),
+        'Regex (default) or semantic (semantic=true) search across indexed files.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Regular expression pattern to search for.",
+                    "description": (
+                        "Regex pattern (regex mode) or natural-language "
+                        "description (semantic mode)."
+                    ),
                 },
                 "max_results": {
                     "type": "integer",
@@ -592,7 +555,16 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 },
                 "ignore_generated": {
                     "type": "boolean",
-                    "description": "Skip generated/minified files (default true).",
+                    "description": "Skip generated/minified files (default true). Regex mode only.",
+                },
+                "semantic": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, interpret `pattern` as a description and "
+                        "rank symbols by embedding cosine similarity. "
+                        "Returns enriched hits with signature/docstring/"
+                        "score. Default false (regex)."
+                    ),
                 },
                 **_PROJECT_PARAM,
             },
@@ -601,11 +573,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "search_in_symbols": {
         "description": (
-            "Regex search that also returns the enclosing function/class for each "
-            "match. Use this instead of search_codebase when the next step is "
-            "probably 'read the containing symbol' — the `symbol` field in each "
-            "hit plugs directly into get_function_source / get_class_source."
-        ),
+        'Regex search that returns the enclosing function/class for each match, in addition to file:line.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -624,7 +592,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     # ── Index management ──────────────────────────────────────────────────
     "reindex": {
-        "description": "Re-index the entire project. No-op if no tracked file mtimes changed (pass force=true to rebuild anyway). Edit tools (replace_symbol_source, insert_near_symbol, etc.) already reindex inline — only needed after external edits (Edit/Write/sed).",
+        "description": (
+        'Rebuild the project index.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -638,10 +607,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "set_project_root": {
         "description": (
-            "Add a new project root to the workspace and switch to it. "
-            "Triggers a full reindex of the new root. "
-            "After calling this, all other tools operate on the new project by default."
-        ),
+        'Register a new project root and switch to it.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -655,7 +622,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     # ── Feature discovery ─────────────────────────────────────────────────
     "get_feature_files": {
-        "description": "Files matching a feature keyword + traced imports, classified by role.",
+        "description": (
+        'Files matching a feature keyword + traced imports, classified by role (core, test, config).'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -669,17 +637,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
     # ── Stats (unified) ───────────────────────────────────────────────────
     "get_stats": {
         "description": (
-            "Unified stats dispatcher. Pass category to select which subsystem:\n"
-            "  - usage (default): session efficiency, tool calls, chars saved\n"
-            "  - session_budget: current session token budget consumption\n"
-            "  - tca: co-activation matrix (symbols tracked, top pairs)\n"
-            "  - dcp: differential context protocol chunk registry\n"
-            "  - linucb: injection model feature weights θ\n"
-            "  - warmstart: cross-session signature store\n"
-            "  - leiden: community detector (modularity Q, sizes)\n"
-            "  - speculation: speculative tool-tree execution stats\n"
-            "  - lattice: adaptive Beta-Binomial posteriors per (context, level)"
-        ),
+        'Unified stats dispatcher. category = usage (default) | session_budget | tca | dcp | linucb | warmstart | leiden | speculation | lattice.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -705,7 +664,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     # ── Routes, Env, Components ───────────────────────────────────────────
     "get_routes": {
-        "description": "Detect all API routes and pages in a Next.js App Router project. Returns route path, file, HTTP methods, and type (api/page/layout).",
+        "description": (
+        'Detect API routes and pages in a Next.js App Router project: path, file, HTTP methods, type.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -718,7 +678,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "get_env_usage": {
-        "description": "Cross-reference an environment variable across all code, .env files, and workflow configs. Shows where it's defined, read, and written.",
+        "description": (
+        "Cross-reference an env var across code, .env files, and workflow configs. Shows where it's defined, read, written."   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -735,29 +696,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": ["var_name"],
         },
     },
-    "get_components": {
-        "description": "Detect React components in .tsx/.jsx files. Identifies pages, layouts, and named components by convention (uppercase name or default export).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Optional file to scan (default: all .tsx/.jsx).",
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Max results (0 = all, default 0).",
-                },
-                **_PROJECT_PARAM,
-            },
-        },
-    },
     # ── Analysis tools ────────────────────────────────────────────────────
     "analyze_config": {
         "description": (
-            "Audit config files (.env/.yaml/.toml/.json). Default = duplicates+secrets+orphans. "
-            "Use `checks=['orphans']` for targeted 'env vars defined but unread' (cheaper)."
-        ),
+        'Audit config files (.env/.yaml/.toml/.json): duplicates, secrets, orphans.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -775,11 +718,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "find_dead_code": {
         "description": (
-            "Project-wide audit of unreferenced functions/classes (zero callers, "
-            "excludes entry points: main, tests, route handlers). "
-            "NOT a listing tool — to list functions of a specific file use "
-            "`get_functions(file_path=...)`; to outline a file use `get_structure_summary`."
-        ),
+        'Project-wide audit of unreferenced functions/classes (zero callers, excludes entry points, tests, route handlers).' ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -793,12 +732,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "find_hotspots": {
         "description": (
-            "Rank functions by a chosen *kind* of hotspot.\n"
-            "  • complexity  — all languages: line count, branching, nesting, params (default min_score 0).\n"
-            "  • allocation  — Java only: object/collection/stream allocation, boxing, formatting (default min_score 1).\n"
-            "  • performance — Java only: blocking calls, locks, synchronized sections, mutable state (default min_score 1).\n"
-            "Replaces find_allocation_hotspots / find_performance_hotspots."
-        ),
+        'Rank functions by hotspot kind. complexity (all langs) | allocation (Java) | performance (Java).'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -821,9 +756,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "detect_breaking_changes": {
         "description": (
-            "Breaking API changes vs a git ref: removed funcs/params, added required params, "
-            "signature changes. TERMINAL — output is complete; do NOT re-explore each item."
-        ),
+        'Breaking API changes vs a git ref: removed funcs/params, added required params, signature changes.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -835,21 +768,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
             },
         },
     },
-    "find_cross_project_deps": {
-        "description": (
-            "Detect dependencies between indexed projects. "
-            "Shows which projects import packages from other indexed projects and shared external dependencies."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
-    },
     "analyze_docker": {
         "description": (
-            "Analyze Dockerfiles in the project: base images, stages, exposed ports, ENV/ARG vars, "
-            "and cross-reference with config files. Flags issues like 'latest' tags and missing env vars."
-        ),
+        'Audit Dockerfiles: base images, stages, exposed ports, ENV/ARG, cross-ref with config files.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -857,28 +778,33 @@ TOOL_SCHEMAS: dict[str, dict] = {
             },
         },
     },
-    "audit_file": {
+    "get_db_schema": {
         "description": (
-            "Mega-batch audit of a single file: dead_code + hotspots + semantic "
-            "duplicates in one call. Use when triaging or reviewing a specific "
-            "file instead of chaining three separate tool calls."
-        ),
+        'Condensed SQL-migration snapshot: tables (cols, types, nullability, defaults), PKs, FKs, indexes, RLS policies.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "file_path": {"type": "string", "description": "Relative path of the file to audit."},
-                "max_dead": {"type": "integer", "description": "Cap on dead-code scan (default 50)."},
-                "max_hotspots": {"type": "integer", "description": "Cap on hotspot scan (default 50)."},
-                "min_score": {"type": "number", "description": "Minimum complexity score (default 0)."},
-                "min_lines": {"type": "integer", "description": "Semantic-dup min length (default 6)."},
-                "max_dup_groups": {"type": "integer", "description": "Semantic-dup group cap (default 20)."},
+                "migrations_dir": {
+                    "type": "string",
+                    "description": "Relative or absolute path to the migrations directory (default: auto-detect).",
+                },
+                "dialect": {
+                    "type": "string",
+                    "description": "SQL dialect -- currently only 'postgres' is implemented.",
+                },
+                "tables": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional filter: only return these table names.",
+                },
                 **_PROJECT_PARAM,
             },
-            "required": ["file_path"],
         },
     },
     "get_entry_points": {
-        "description": "Score functions by likelihood of being execution entry points (routes, handlers, main functions, exported APIs). Returns functions with score and reasons, sorted by likelihood desc.",
+        "description": (
+        'Score functions by likelihood of being execution entry points: routes, handlers, main, exported APIs.' ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -890,79 +816,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
             },
         },
     },
-    "get_related_symbols": {
-        "description": (
-            "Unified related-symbols query. Choose *method*:\n"
-            "  • community  — Leiden community for `name` (or `list_all=true` to enumerate all).\n"
-            "  • rwr        — Random-walk-with-restart ranking centred on `name` (catches multi-hop).\n"
-            "  • cluster    — Greedy-modularity cluster for `name` (dependency graph).\n"
-            "  • coactive   — TCA co-activation (symbols often accessed together with `name`).\n"
-            "Replaces get_community / get_relevance_cluster / get_symbol_cluster / "
-            "get_coactive_symbols."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "method": {
-                    "type": "string",
-                    "enum": ["community", "rwr", "cluster", "coactive"],
-                    "description": "Algorithm (default 'community').",
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Seed symbol. Required for rwr/cluster/coactive; optional for community when list_all=true.",
-                },
-                "max_members": {
-                    "type": "integer",
-                    "description": "cluster: max members (default 30).",
-                },
-                "budget": {
-                    "type": "integer",
-                    "description": "rwr: top-K symbols (default 10).",
-                },
-                "include_reverse": {
-                    "type": "boolean",
-                    "description": "rwr: include reverse-dependency edges (default true).",
-                },
-                "top_k": {
-                    "type": "integer",
-                    "description": "coactive: max results (default 5).",
-                },
-                "community_name": {
-                    "type": "string",
-                    "description": "community: look up by community name instead of seed symbol.",
-                },
-                "list_all": {
-                    "type": "boolean",
-                    "description": "community: enumerate all communities (default false).",
-                },
-                "min_size": {
-                    "type": "integer",
-                    "description": "community+list_all: min members (default 2).",
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "community+list_all: max communities (default 30).",
-                },
-                **_PROJECT_PARAM,
-            },
-        },
-    },
-    "get_duplicate_classes": {
-        "description": "Find Java classes duplicated across files (by FQN, or simple name).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Filter class."},
-                "simple_name_mode": {"type": "boolean", "description": "Group by simple name."},
-                "max_results": {"type": "integer", "description": "0=all."},
-                **_PROJECT_PARAM,
-            },
-        },
-    },
     # ── Memory Engine tools ───────────────────────────────────────────────
     "memory_save": {
-        "description": "Save an observation to memory.",
+        "description": (
+        'Persist a fact, guardrail, or note across sessions.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1005,128 +863,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": ["type", "title", "content"],
         },
     },
-    "memory_maintain": {
-        "description": "Maintenance: promote, relink, export, patterns.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["promote", "relink", "export", "patterns"], "description": "Action"},
-                "dry_run": {"type": "boolean", "description": "Preview only"},
-                "output_dir": {"type": "string", "description": "Export dir"},
-                "window_days": {"type": "integer", "description": "Patterns window"},
-                "min_occurrences": {"type": "integer", "description": "Patterns threshold"},
-                **_PROJECT_PARAM,
-            },
-            "required": ["action"],
-        },
-    },
-    "memory_top": {
-        "description": "Rank obs by score, access_count, or age.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "description": "Default 20."},
-                "sort_by": {"type": "string", "enum": ["score", "access_count", "age"]},
-            },
-        },
-    },
-    "memory_why": {
-        "description": "Explain why an obs matched (recency, type, symbol, FTS).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "integer"},
-                "query": {"type": "string", "description": "Optional FTS query."},
-            },
-            "required": ["id"],
-        },
-    },
-    "memory_doctor": {
-        "description": "Memory health report (orphans, near-dupes, incomplete, vector coverage).",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    "memory_vector_reindex": {
-        "description": "Backfill obs_vectors for observations missing an embedding. No-op when sqlite-vec / sentence-transformers are unavailable.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "description": "Max obs to index this run (default 500)."},
-                **_PROJECT_PARAM,
-            },
-        },
-    },
-    "memory_distill": {
-        "description": "MDL distillation: cluster similar obs into abstraction + deltas.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "dry_run": {"type": "boolean", "description": "Preview (default true)."},
-                "min_cluster_size": {"type": "integer", "description": "Default 3."},
-                "compression_required": {"type": "number", "description": "Default 0.2."},
-                **_PROJECT_PARAM,
-            },
-        },
-    },
-    "memory_dedup_sweep": {
-        "description": "Backfill observations.content_hash (SHA256 of normalized content). Default backfills NULL hashes only; set recompute=true after a hash-formula change.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "recompute": {"type": "boolean", "description": "Rehash every row, not just NULL (default false)."},
-                "batch_size": {"type": "integer", "description": "Commit cadence (default 500)."},
-                **_PROJECT_PARAM,
-            },
-        },
-    },
-    "memory_roi_gc": {
-        "description": "Archive obs with ROI below threshold.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "dry_run": {"type": "boolean", "description": "Preview (default true)."},
-                "threshold": {"type": "number", "description": "Default 0.0."},
-                **_PROJECT_PARAM,
-            },
-        },
-    },
-    "memory_roi_stats": {
-        "description": "Token Economy ROI stats (net, by type).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {**_PROJECT_PARAM},
-        },
-    },
-    "memory_from_bash": {
-        "description": "Save a bash command as observation (type=command).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string"},
-                "type": {"type": "string", "enum": ["command", "infra", "config"]},
-                "context": {"type": "string"},
-                **_PROJECT_PARAM,
-            },
-            "required": ["command"],
-        },
-    },
-    "memory_set_global": {
-        "description": "Set observation global visibility.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "integer", "description": "Observation ID"},
-                "is_global": {"type": "boolean", "description": "True=global, False=local"},
-            },
-            "required": ["id", "is_global"],
-        },
-    },
     "memory_search": {
         "description": (
-            "[Layer 2/3 — Progressive Disclosure] "
-            "Estimated tokens: ~60 per result. Use before memory_get. "
-            "FTS5 search over observations (compact rows with snippets). "
-            "Also surfaces matching session_summaries rollups as a separate section."
-        ),
+        'Layer 2 FTS5 search over memory observations, compact rows with snippets (~60 tokens/result).'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1138,26 +877,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": ["query"],
         },
     },
-    "memory_session_history": {
-        "description": (
-            "Last N structured session-end rollups (request / investigated / "
-            "learned / completed / next_steps / notes) for the current project."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "description": "Default 10."},
-                **_PROJECT_PARAM,
-            },
-        },
-    },
     "memory_get": {
         "description": (
-            "[Layer 3/3 — Progressive Disclosure] "
-            "Estimated tokens: ~200 per result. Final layer — full content. "
-            "Get full details of observations by IDs. Accepts integers, digit strings, "
-            "or `ts://obs/{id}` citation URIs (as emitted by `memory_index`)."
-        ),
+        'Layer 3: full observation content by IDs (~200 tokens/result). Final progressive-disclosure layer.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1179,7 +902,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "memory_delete": {
-        "description": "Soft-delete an observation by ID (sets archived=1).",
+        "description": (
+        'Soft-delete an observation by ID (sets archived=1).'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1194,11 +919,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "memory_index": {
         "description": (
-            "[Layer 1/3 — Progressive Disclosure] "
-            "Estimated tokens: ~15 per result. Use before memory_search. "
-            "Compact index of recent observations: ID, type, title, importance, date, "
-            "citation URI. Always start here when exploring memory."
-        ),
+        'Layer 1: compact index of recent observations — ID, type, title, importance, age, citation URI.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1215,56 +936,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": [],
         },
     },
-    "memory_timeline": {
-        "description": (
-            "Chronological context around an observation (Layer 2). "
-            "Shows observations before and after for temporal context."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "observation_id": {
-                    "type": "integer",
-                    "description": "Center observation ID.",
-                },
-                "window": {
-                    "type": "integer",
-                    "description": "Window in hours around the observation (default 24).",
-                },
-                **_PROJECT_PARAM,
-            },
-            "required": ["observation_id"],
-        },
-    },
-    "memory_prompts": {
-        "description": "Save or search prompt history.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["save", "search"], "description": "save or search"},
-                "prompt_text": {"type": "string", "description": "Prompt to save"},
-                "prompt_number": {"type": "integer", "description": "Prompt ordinal"},
-                "query": {"type": "string", "description": "Search query"},
-                "limit": {"type": "integer", "description": "Max results"},
-                **_PROJECT_PARAM,
-            },
-            "required": ["action"],
-        },
-    },
-    "memory_mode": {
-        "description": "Get or set memory capture mode.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["get", "set", "set_project"], "description": "Action"},
-                "mode": {"type": "string", "enum": ["code", "review", "debug", "silent"], "description": "Mode name"},
-                "project": {"type": "string", "description": "Project path"},
-            },
-            "required": ["action"],
-        },
-    },
     "corpus_build": {
-        "description": "Build a thematic corpus from obs (filter type/tags/symbol).",
+        "description": (
+        'Build a thematic corpus from observations filtered by type / tags / symbol.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1277,71 +952,38 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": ["name"],
         },
     },
-    "memory_archive": {
-        "description": "Manage archived observations.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["run", "list", "restore"], "description": "run=decay, list, restore"},
-                "id": {"type": "integer", "description": "ID for restore"},
-                "dry_run": {"type": "boolean", "description": "Preview only"},
-                "limit": {"type": "integer", "description": "List max entries"},
-                **_PROJECT_PARAM,
-            },
-            "required": ["action"],
-        },
-    },
-    "memory_status": {
-        "description": (
-            "Quick overview of the Memory Engine for the active project: active/archived "
-            "obs count, current mode, last session + end_type, last summary date, prompts archived."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
-    },
     # ── Program slicing & context packing (Phase 2) ───────────────────────
-    "verify_edit": {
-        "description": (
-            "EditSafety certificate before applying a symbol replacement. "
-            "Static analysis only: signature, exceptions, side-effects, tests."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "symbol_name": {
-                    "type": "string",
-                    "description": "Symbol that would be replaced.",
-                },
-                "new_source": {
-                    "type": "string",
-                    "description": "Proposed replacement source.",
-                },
-                "file_path": {
-                    "type": "string",
-                    "description": "Optional file path to disambiguate the symbol.",
-                },
-                **_PROJECT_PARAM,
-            },
-            "required": ["symbol_name", "new_source"],
-        },
-    },
     "find_semantic_duplicates": {
         "description": (
-            "Find semantically identical functions across the codebase via "
-            "AST-normalised hashing (alpha-renaming, docstrings stripped)."
-        ),
+        "Find duplicate functions. method='ast' (fast, hash-based, catches copy-paste) or 'embedding' (Nomic cosine, catches conceptual clones, tagged sim=min..mean per cluster)."
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "min_lines": {
                     "type": "integer",
-                    "description": "Skip functions shorter than this (default 2).",
+                    "description": "Skip functions shorter than this (default 2). Applies to method='ast'.",
                 },
                 "max_groups": {
                     "type": "integer",
                     "description": "Max duplicate groups to return (default 10). Raise for full audit.",
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["ast", "embedding"],
+                    "description": (
+                        "ast (default, fast, exact) or embedding (slower, "
+                        "catches conceptual clones). Embedding reuses the "
+                        "symbol_vectors index from search_codebase(semantic=True) "
+                        "— first call triggers a ~2min reindex."
+                    ),
+                },
+                "min_similarity": {
+                    "type": "number",
+                    "description": (
+                        "Cosine threshold for method='embedding' (default 0.90). "
+                        "Lower = more recall + more noise."
+                    ),
                 },
                 **_PROJECT_PARAM,
             },
@@ -1349,10 +991,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "find_import_cycles": {
         "description": (
-            "Detect import cycles (strongly-connected components) in the "
-            "file-level import graph using Tarjan's algorithm. Returns sorted "
-            "list of cycles."
-        ),
+        "Detect import cycles (strongly-connected components) in the file-level import graph (Tarjan's)."   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1364,62 +1003,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
             },
         },
     },
-    "get_call_predictions": {
-        "description": (
-            "Predict the next likely tool calls based on the persistent first-order "
-            "Markov model trained on this session and prior sessions."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "tool_name": {
-                    "type": "string",
-                    "description": "Current tool name (e.g. 'get_function_source').",
-                },
-                "symbol_name": {
-                    "type": "string",
-                    "description": "Optional current symbol focus (e.g. 'observation_save').",
-                },
-                "top_k": {
-                    "type": "integer",
-                    "description": "Maximum number of predictions to return (default 5).",
-                },
-            },
-            "required": ["tool_name"],
-        },
-    },
-    "pack_context": {
-        "description": "Knapsack-packed context bundle for a query within token budget.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "budget_tokens": {"type": "integer", "description": "Default 4000."},
-                "max_symbols": {"type": "integer", "description": "Default 20."},
-                **_PROJECT_PARAM,
-            },
-            "required": ["query"],
-        },
-    },
-    "get_backward_slice": {
-        "description": "Minimal lines affecting `variable` at `line` in symbol `name`.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "variable": {"type": "string"},
-                "line": {"type": "integer", "description": "1-based."},
-                "file_path": {"type": "string"},
-                **_PROJECT_PARAM,
-            },
-            "required": ["name", "variable", "line"],
-        },
-    },
     "corpus_query": {
         "description": (
-            "Format all observations of a corpus as markdown context + a question, "
-            "ready for Claude to answer with full context injected."
-        ),
+        'Format all observations of a named corpus as markdown context + a question, ready for answering.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1436,38 +1023,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": ["name", "question"],
         },
     },
-    "memory_bus_push": {
-        "description": "Push a volatile obs to the inter-agent bus (tagged agent_id).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "agent_id": {"type": "string"},
-                "title": {"type": "string"},
-                "content": {"type": "string"},
-                "type": {"type": "string", "description": "Default 'note'."},
-                "symbol": {"type": "string"},
-                "file_path": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "ttl_days": {"type": "integer", "description": "Default 1."},
-                **_PROJECT_PARAM,
-            },
-            "required": ["agent_id", "title", "content"],
-        },
-    },
-    "memory_bus_list": {
-        "description": "List recent live messages on the inter-agent memory bus, optionally filtered by agent_id.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "agent_id": {"type": "string", "description": "Filter by subagent id (optional)."},
-                "limit": {"type": "integer", "description": "Max rows (default 20)."},
-                "include_expired": {"type": "boolean", "description": "Show expired bus rows too."},
-                **_PROJECT_PARAM,
-            },
-        },
-    },
     "reasoning_save": {
-        "description": "Persist a reasoning trace (goal+steps+conclusion) for reuse.",
+        "description": (
+        'Persist a reasoning trace (goal + steps + conclusion) for later reuse.'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1484,9 +1043,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "reasoning_search": {
         "description": (
-            "Search stored reasoning chains by goal similarity (FTS5 + Jaccard). "
-            "Returns previous chains whose goal overlaps the query."
-        ),
+        'Search stored reasoning chains by goal similarity (FTS5 + Jaccard).'
+    ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1502,7 +1060,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "reasoning_list": {
-        "description": "List stored reasoning chains sorted by access_count then recency.",
+        "description": (
+        'List stored reasoning chains by access_count then recency.'   ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1511,46 +1070,126 @@ TOOL_SCHEMAS: dict[str, dict] = {
             },
         },
     },
-    "memory_consistency": {
-        "description": (
-            "Run Bayesian self-consistency check on symbol-linked observations "
-            "(updates validity α/β, flags stale_suspected and quarantine)."
-        ),
+    # ── Tool Capture (sandbox of verbose tool outputs) ───────────────────
+    "capture_put": {
+        "description": 'Sandbox a verbose tool output to FTS5 store; returns id + preview.',
         "inputSchema": {
             "type": "object",
+            "required": ["tool_name", "output"],
             "properties": {
-                "project_root": {
-                    "type": "string",
-                    "description": "Project filter; omit to run across all projects.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max observations to check this pass (default 100).",
-                },
-                "dry_run": {
-                    "type": "boolean",
-                    "description": "Report what would change without persisting.",
-                },
+                "tool_name": {"type": "string", "description": "Logical tool name (e.g. 'Bash', 'WebFetch', 'mcp__playwright__snapshot')."},
+                "output": {"type": "string", "description": "Full raw output to capture."},
+                "args_summary": {"type": "string", "description": "Short human description of the call (URL, command, query)."},
+                "session_id": {"type": "string", "description": "Optional session id to scope retrieval."},
+                "project_root": {"type": "string", "description": "Optional active project root."},
+                "meta": {"type": "object", "description": "Free-form metadata stored alongside the capture."},
             },
         },
     },
-    "memory_quarantine_list": {
+    "capture_search": {
+        "description": 'BM25 search across sandboxed tool outputs. Returns id, snippet, bytes.',
+        "inputSchema": {
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "description": "FTS5 query (terms ANDed by default)."},
+                "limit": {"type": "integer", "description": "Max rows (default 20)."},
+                "session_id": {"type": "string"},
+                "project_root": {"type": "string"},
+                "tool_name": {"type": "string", "description": "Restrict to a single source tool."},
+            },
+        },
+    },
+    "capture_get": {
+        "description": 'Read a capture (range: head/tail/all/preview/line:N-M).',
+        "inputSchema": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": {"type": "integer", "description": "Capture id (from search/list)."},
+                "range": {"type": "string", "description": "head | tail | all | preview | line:start-end (default preview)."},
+                "max_bytes": {"type": "integer", "description": "Cap returned content size."},
+            },
+        },
+    },
+    "capture_aggregate": {
+        "description": 'Aggregate over a capture: stats|count_lines|unique_lines|extract:<re>|count:<re>.',
+        "inputSchema": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": {"type": "integer"},
+                "transform": {"type": "string", "description": "stats (default) | count_lines | unique_lines | extract | count | extract:<regex> | count:<regex>"},
+                "pattern": {"type": "string", "description": "Regex when transform is 'extract' or 'count' without inline regex."},
+            },
+        },
+    },
+    "capture_list": {
+        "description": 'List recent captures (newest first).',
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "project_root": {"type": "string"},
+                "tool_name": {"type": "string"},
+                "limit": {"type": "integer", "description": "Max rows (default 50)."},
+            },
+        },
+    },
+    "capture_purge": {
+        "description": 'Delete captures by age/session/project (filter required).',
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "older_than_sec": {"type": "integer", "description": "Delete captures older than this many seconds."},
+                "session_id": {"type": "string"},
+                "project_root": {"type": "string"},
+            },
+        },
+    },
+    "memory_admin": {
+        "description": "Single dispatch for all memory admin / maintenance ops (status, doctor, dedup_sweep, distill, roi_gc, consistency, vector_reindex, etc.).",
+        "inputSchema": {
+            "type": "object",
+            "required": ["op"],
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["status", "top", "why", "timeline", "session_history", "prompts", "mode", "archive", "bus_push", "bus_list", "consistency", "quarantine_list", "maintain", "doctor", "vector_reindex", "distill", "dedup_sweep", "roi_gc", "roi_stats", "from_bash", "set_global"],
+                    "description": "Which memory-admin sub-operation to run.",
+                },
+                "project_root": {"type": "string", "description": "Filter by project (where applicable)."},
+                "limit": {"type": "integer", "description": "Pagination/limit (where applicable)."},
+                "dry_run": {"type": "boolean", "description": "Preview-only mode for sweeps/garbage collectors."},
+            },
+            "additionalProperties": True,
+        },
+    },
+    # ── Defer-loading router (lets thin manifests pull tool schemas just-in-time) ──
+    "ts_search": {
         "description": (
-            "List observations currently quarantined by the consistency check "
-            "(Bayesian validity below 40%)."
+            "Find the top-K Token Savior tools most relevant to a natural-language "
+            "query via embedding cosine similarity. Use when the manifest is in 'tiny' "
+            "profile or you don't know which tool fits. Returns each candidate with "
+            "its full inputSchema so the next turn can call it directly."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project_root": {
+                "query": {
                     "type": "string",
-                    "description": "Filter by project; omit for all projects.",
+                    "description": "Natural-language description of what you need (e.g. 'find dependents of update_user').",
                 },
-                "limit": {
+                "top_k": {
                     "type": "integer",
-                    "description": "Max rows to return (default 50).",
+                    "description": "How many tool candidates to return (default 5, max 12).",
+                },
+                "include_schema": {
+                    "type": "boolean",
+                    "description": "If false, drop inputSchema from the response (smaller payload).",
                 },
             },
+            "required": ["query"],
         },
     },
 }

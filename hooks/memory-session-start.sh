@@ -1,5 +1,26 @@
 #!/bin/bash
 # Memory Engine — SessionStart hook
+#
+# TS_HOOK_MINIMAL=1     -> emit only the Memory Index block (skip Continuity,
+#                          Tool Capture status, Warm start, statusline, decay).
+# TS_MEMORY_DISABLE=1   -> short-circuit entirely (no output at all). Used by
+#                          tsbench subprocesses where cross-project memory
+#                          would pollute task context.
+
+if [ "$TS_MEMORY_DISABLE" = "1" ]; then
+    exit 0
+fi
+
+# -- token-savior hook error log (see GitHub #15) ---------------------------
+# Re-routes stderr from Python / claude sub-shells so a broken import, a
+# missing venv, or a corrupt DB surfaces somewhere instead of vanishing.
+# Rotates at 2 MB (keeps tail 1 MB) so it never fills the disk.
+ERR_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/token-savior/hook-errors.log"
+mkdir -p "$(dirname "$ERR_LOG")" 2>/dev/null || true
+if [ -f "$ERR_LOG" ] && [ "$(stat -c%s "$ERR_LOG" 2>/dev/null || echo 0)" -gt 2000000 ]; then
+    tail -c 1000000 "$ERR_LOG" > "$ERR_LOG.tmp" 2>/dev/null && mv "$ERR_LOG.tmp" "$ERR_LOG"
+fi
+# -- end token-savior hook error log -----------------------------------------
 RESULT=$(/root/.local/token-savior-venv/bin/python3 -c "
 import sys, os, json
 sys.path.insert(0, '/root/token-savior/src')
@@ -124,7 +145,7 @@ if project:
             print('')
     except Exception:
         pass
-" 2>/dev/null)
+" 2>>"$ERR_LOG")
 
 if [ -n "$RESULT" ]; then
     echo "$RESULT"
@@ -151,7 +172,14 @@ if project:
         db.execute('UPDATE sessions SET tokens_injected=? WHERE id=?', [$INJECTED_TOKENS, row[0]])
         db.commit()
     db.close()
-" 2>/dev/null
+" 2>>"$ERR_LOG"
+fi
+
+# TS_HOOK_MINIMAL=1 short-circuit — skip warm-start, capture status,
+# statusline, and weekly housekeeping subshell. Memory Index + Continuity
+# already emitted above are kept.
+if [ "$TS_HOOK_MINIMAL" = "1" ]; then
+    exit 0
 fi
 
 # Warm start: find similar historical sessions by signature and pre-warm PPM
@@ -197,10 +225,34 @@ if similar:
             prefetcher.record_call(top_tools[-1][0], '')
     prefetcher.save()
     print(f'🔥 Warm start: {len(similar)} similar sessions (best: {best_sim:.0%}) — {seeded_pairs} PPM seeds')
-" 2>/dev/null)
+" 2>>"$ERR_LOG")
 
 if [ -n "$WARMSTART" ]; then
     echo "$WARMSTART"
+fi
+
+# Tool Capture status — show recent sandbox count if table populated
+CAPTURELINE=$(/root/.local/token-savior-venv/bin/python3 -c "
+import sys, os, time
+sys.path.insert(0, '/root/token-savior/src')
+try:
+    from token_savior import db_core
+    conn = db_core.get_db()
+    row = conn.execute('SELECT COUNT(*) FROM tool_captures').fetchone()
+    total = row[0] if row else 0
+    if total > 0:
+        cutoff = int(time.time()) - 3600
+        recent = conn.execute('SELECT COUNT(*) FROM tool_captures WHERE created_at_epoch > ?', (cutoff,)).fetchone()[0]
+        bytes_total = conn.execute('SELECT COALESCE(SUM(output_bytes), 0) FROM tool_captures').fetchone()[0]
+        kb = bytes_total // 1024
+        print(f'### 📦 Tool Capture: {total} captures sandboxed ({kb}KB) · {recent} in last hour. Use capture_search/get/aggregate to retrieve.')
+        print('')
+    conn.close()
+except Exception:
+    pass
+" 2>>"$ERR_LOG")
+if [ -n "$CAPTURELINE" ]; then
+    echo "$CAPTURELINE"
 fi
 
 # Statusline: [mem:N obs · mode:X]
@@ -234,7 +286,7 @@ try:
 except Exception:
     label = origin
 print(f'[mem:{count} obs · mode:{mode_name} · {label}]')
-" 2>/dev/null)
+" 2>>"$ERR_LOG")
 
 if [ -n "$STATUSLINE" ]; then
     echo "$STATUSLINE"
@@ -270,14 +322,14 @@ if project:
     promo = memory_db.run_promotions(project_root='', dry_run=False)
     if promo.get('count', 0) > 0:
         print(f'[promote] {promo[\"count\"]} obs elevated', file=sys.stderr)
-" 2>/dev/null
+" 2>>"$ERR_LOG"
         echo "$NOW" > "$FLAG"
     fi
 
     # Monthly Token Economy ROI garbage collection (30-day interval)
     ROI_FLAG=/root/.local/share/token-savior/last_roi_gc
     LAST_ROI=0
-    [ -f "$ROI_FLAG" ] && LAST_ROI=$(cat "$ROI_FLAG" 2>/dev/null || echo 0)
+    [ -f "$ROI_FLAG" ] && LAST_ROI=$(cat "$ROI_FLAG" 2>>"$ERR_LOG" || echo 0)
     AGE_ROI=$((NOW - LAST_ROI))
     if [ "$AGE_ROI" -ge 2592000 ]; then
         /root/.local/token-savior-venv/bin/python3 -c "
@@ -286,14 +338,14 @@ sys.path.insert(0, '/root/token-savior/src')
 from token_savior import memory_db
 res = memory_db.run_roi_gc(dry_run=False)
 print(f'[roi-gc] archived={res.get(\"archived\",0)} kept={res.get(\"kept\",0)} threshold={res.get(\"threshold\",0)}', file=sys.stderr)
-" 2>/dev/null
+" 2>>"$ERR_LOG"
         echo "$NOW" > "$ROI_FLAG"
     fi
 
     # Weekly markdown export (fire-and-forget)
     EXPORT_FLAG=/root/.local/share/token-savior/last_md_export
     LAST_EXP=0
-    [ -f "$EXPORT_FLAG" ] && LAST_EXP=$(cat "$EXPORT_FLAG" 2>/dev/null || echo 0)
+    [ -f "$EXPORT_FLAG" ] && LAST_EXP=$(cat "$EXPORT_FLAG" 2>>"$ERR_LOG" || echo 0)
     AGE_EXP=$((NOW - LAST_EXP))
     if [ "$AGE_EXP" -ge 604800 ]; then
         /root/.local/token-savior-venv/bin/python3 \

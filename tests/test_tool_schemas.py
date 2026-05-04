@@ -57,7 +57,30 @@ class TestToolSchemas:
         # hotspots 3->1 (-2). Total -18 => 88 tools.
         # +1 search_in_symbols (content search + structural enclosing symbol) = 89.
         # +1 audit_file (mega-batch: dead_code + hotspots + duplicates) = 90.
-        assert len(TOOL_SCHEMAS) == 90, f"Expected 90 tools, got {len(TOOL_SCHEMAS)}"
+        # +1 get_db_schema (SQL migrations parser) = 91.
+        # +1 get_library_symbol (.d.ts / Python stub lookup) = 92.
+        # +1 list_library_symbols (package export list) = 93.
+        # +1 find_library_symbol_by_description (feature 3 — semantic library lookup) = 94.
+        # +6 tool_capture (capture_put/search/get/aggregate/list/purge — sandbox of
+        #   verbose tool outputs, response to mksglu/context-mode) = 100.
+        # +1 edit_lines_in_symbol (symbol-scoped string-replace, captures the
+        #   80%+ of native Edit calls landing on indexed code files) = 101.
+        # -15 round-3 dead-tool removal (apply_refactoring, apply_symbol_change_and_validate,
+        #   audit_file, verify_edit, find_cross_project_deps,
+        #   find_library_symbol_by_description, get_backward_slice,
+        #   get_call_predictions, get_components, get_duplicate_classes,
+        #   get_library_symbol, get_related_symbols, list_library_symbols,
+        #   pack_context, summarize_patch_by_symbol — 0 prod calls in 30 d
+        #   and no marginal value) = 86.
+        # -21 round-5 memory_admin fusion (memory_status / top / why / timeline /
+        #   session_history / prompts / mode / archive / bus_push / bus_list /
+        #   consistency / quarantine_list / maintain / doctor / vector_reindex /
+        #   distill / dedup_sweep / roi_gc / roi_stats / from_bash / set_global
+        #   collapsed into a single memory_admin(op=...) dispatcher) = 65.
+        # +1 memory_admin (the fusion itself) = 66.
+        # +1 ts_search (v2.9 defer-loading discovery tool — exposed as a
+        #   schema entry so it appears in lean/nav manifests) = 67.
+        assert len(TOOL_SCHEMAS) == 67, f"Expected 67 tools, got {len(TOOL_SCHEMAS)}"
 
     def test_server_tools_match_schemas(self):
         from token_savior.server import TOOLS

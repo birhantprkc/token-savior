@@ -4,14 +4,14 @@
 
 # ⚡ Token Savior Recall
 
-> Structural code navigation + persistent memory engine for Claude Code.
-> **97% fewer tokens. Nothing forgotten between sessions.**
+> The MCP server that turns Claude into the only coding agent hitting **100%** on a real benchmark.
+> Structural code navigation + persistent memory. **−77% active tokens. −76% wall time. Zero losses.**
 
-[![Version](https://img.shields.io/badge/version-2.7.1-blue)](https://github.com/Mibayy/token-savior/releases/tag/v2.7.1)
-[![Tools](https://img.shields.io/badge/tools-90-green)]()
-[![Tests](https://img.shields.io/badge/tests-1318%2F1318-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-3.0.0-blue)](https://github.com/Mibayy/token-savior/releases/tag/v3.0.0)
+[![Tools](https://img.shields.io/badge/tools-67-green)]()
+[![Tests](https://img.shields.io/badge/tests-1451%2F1451-brightgreen)]()
 [![Savings](https://img.shields.io/badge/token%20savings-97%25-cyan)]()
-[![Benchmark](https://img.shields.io/badge/tsbench-100%25%20(180%2F180)-brightgreen)](https://mibayy.github.io/token-savior/)
+[![Benchmark](https://img.shields.io/badge/tsbench-100%25%20(192%2F192)-brightgreen)](https://mibayy.github.io/token-savior/)
 [![Vector](https://img.shields.io/badge/vector%20search-enabled-purple)]()
 [![CI](https://github.com/Mibayy/token-savior/actions/workflows/ci.yml/badge.svg)](https://github.com/Mibayy/token-savior/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -22,19 +22,25 @@
 
 ---
 
-### Benchmark — 90 real coding tasks
+### Benchmark — 96 real coding tasks (tiny+v2 default)
 
 | | Plain Claude Code | With Token Savior |
 |---|---:|---:|
-| **Score** | 141 / 180 (78.3%) | **180 / 180 (100.0%)** |
-| **Active tokens** | 1.55 M | **804 k** (−48%) |
-| **Wall time** | 166 min | **35 min** (−79%) |
-| **Wins / Ties / Losses** | — | **25 / 65 / 0** |
+| **Score** | 141 / 180 (78.3%) | **192 / 192 (100.0%)** |
+| **Active tokens / task** | 17 221 | **3 929** (−77%) |
+| **Wall time / task** | 110.6 s | **26.6 s** (−76%) |
+| **Wins / Ties / Losses** | — | **25 / 65 / 0** (90 paired) |
 
 Perfect (100%) across all 11 categories: `audit`, `bug_fixing`,
-`code_generation`, `code_review`, `config_infra`, `documentation`,
-`explanation`, `git`, `navigation`, `refactoring`, `writing_tests`.
-Zero losses against plain Claude — every task is a win or a tie.
+`code_generation`, `code_review`, `config_infra`, `data_analysis`,
+`documentation`, `explanation`, `git`, `navigation`, `refactoring`,
+`writing_tests`. Zero losses against plain Claude — every task is a
+win or a tie.
+
+The default config — `TS_PROFILE=tiny_plus` (15 tools, ~2.5 KT manifest)
++ `TS_CAPTURE_DISABLED=1` + the v2 system prompt that bans `Agent`
+sub-agent delegation — reproduces 100% on Opus 4.7 with **−54% active
+tokens vs the legacy `lean` profile**.
 
 Also validated on Sonnet 4.6 (ts 170/180 = 94.4% vs base 156/180 = 86.7%).
 
@@ -70,8 +76,8 @@ contract keeps lookup cost bounded.
 | `get_change_impact("LLMClient")` | impossible | 16K chars (154 direct + 492 transitive) | new capability |
 | `get_backward_slice(var, line)` | 130 lines | 12 lines | **−92%** |
 | `memory_index` (Layer 1) | n/a | ~15 tokens/result | Layer 1 shortlist |
-| 60-task tsbench run | 1.43 M chars | 216 k chars | **−85%** |
-| tsbench score | 67/120 (56%) | **118/120 (98%)** | **+42 pts** |
+| 90-task tsbench (Opus base→ts) | 17.2 KT active/task | 3.9 KT active/task | **−77%** |
+| tsbench score (Opus, 96 tasks) | 141/180 (78.3%) | **192/192 (100.0%)** | **+22 pts** |
 
 Full benchmark methodology and per-task results: [tsbench](https://github.com/Mibayy/tsbench).
 
@@ -202,11 +208,77 @@ keeping handlers live.
 
 | Profile | Advertised | ~Tokens | Use case |
 |---------|-----------:|--------:|----------|
-| `full` *(default)* | 106 | ~10 950 | All capabilities |
+| `full` *(default)* | 67  | ~8 770  | All capabilities |
 | `core`             | 54  | ~5 800  | Daily coding, no memory engine |
 | `nav`              | 28  | ~3 100  | Read-only exploration |
-| `lean`             | 59  | ~6 620  | Memory engine off — used in tsbench v2 |
-| `ultra`            | 17  | ~2 740  | Hot tools only + `ts_extended` meta-tool for lazy discovery |
+| `lean`             | 52  | ~6 940  | Memory engine off — used in tsbench v2 |
+| `ultra`            | 31  | ~4 250  | Hot tools + `ts_extended` meta-tool |
+| `tiny` *(new)*     |  6  | ~1 070  | Defer-loading via `ts_search` (Tool Attention pattern) |
+
+### Bench-mode env vars
+
+For benchmark / cold-start workloads where memory and capture sandboxing
+add no value, pair the profile with these env vars:
+
+```bash
+export TOKEN_SAVIOR_PROFILE=lean      # or 'tiny' for max trim
+export TS_MEMORY_DISABLE=1            # hide memory_* (-300 t)
+export TS_CAPTURE_DISABLED=1          # hide capture_*, skip PostToolUse hook
+export TS_HOOK_MINIMAL=1              # SessionStart emits Memory Index only
+export TS_NO_HINTS=1                  # drop _hints / _suggestion (~30-50 t/call)
+```
+
+Measured on tsbench (90 tasks, Claude Opus 4.7):
+
+| Configuration                                  | Active tokens / task | Score   |
+| ---------------------------------------------- | -------------------: | :-----: |
+| Plain agent (Read/Grep/Bash, no Token Savior)  |              17 221  | 78.3 %  |
+| `lean` profile (default since v2.9)            |               8 928  | 100.0 % |
+| `lean` + the 5 env vars above                  |              ~5 500  | 100.0 % |
+
+### Defer-loading via `ts_search`
+
+When the manifest budget is the bottleneck, the new `tiny` profile
+exposes only 6 tools (`switch_project`, `find_symbol`,
+`get_function_source`, `get_full_context`, `search_codebase`,
+`ts_search`). Other ~60 tools are reachable just-in-time via:
+
+```python
+ts_search(query="find dependents of update_user", top_k=5)
+# → {"matched_tools": [{"name": "get_dependents", "score": 0.68, ...}, ...]}
+```
+
+Embeddings (Nomic 768d) score every tool description against the query;
+top-K candidates come back with their full inputSchema so the next turn
+can call them directly. Mirrors the
+[Tool Attention paper](https://arxiv.org/html/2604.21816v1)
+(47.3k → 2.4k tokens / turn at 120 tools, −95 % prefix).
+
+### Anthropic API users — pair with native context management
+
+For long agent loops, combine Token Savior with Anthropic's native
+context primitives (Claude API ≥ 2025-09-19):
+
+```python
+client = anthropic.Anthropic(default_headers={
+    "anthropic-beta": "context-management-2025-06-27,clear-tool-uses-2025-09-19",
+})
+resp = client.messages.create(
+    model="claude-opus-4-7",
+    context_management={"edits": [{
+        "type": "clear_tool_uses_20250919",
+        "trigger": {"type": "input_tokens", "value": 30_000},
+        "keep": {"type": "tool_uses", "value": 4},
+        "exclude_tools": ["replace_symbol_source", "edit_lines_in_symbol"],
+    }]},
+    tools=[...],
+    messages=[...],
+)
+```
+
+Anthropic's
+[cookbook](https://platform.claude.com/cookbook/tool-use-context-engineering-context-engineering-tools)
+measures **−48 % peak context** with clearing alone on long agent loops.
 
 ---
 
@@ -241,6 +313,6 @@ MIT — see [LICENSE](LICENSE).
 <div align="center">
 
 **Works with any MCP-compatible AI coding tool.**
-Claude Code · Cursor · Windsurf · Cline · Continue · any custom MCP client
+Claude Code · Cursor · Codex CLI · Antigravity · Cline · Continue · Windsurf · Aider · Gemini CLI · Copilot CLI · Zed · any custom MCP client
 
 </div>

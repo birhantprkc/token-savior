@@ -38,6 +38,9 @@ def test_full_profile_exposes_all_tools(monkeypatch):
 
 
 def test_unset_defaults_to_full(monkeypatch):
+    """Default profile is 'full' (66 tools). Reverted from the brief Round-6
+    ultra-default experiment per user preference. ultra and lean remain
+    opt-in via TOKEN_SAVIOR_PROFILE."""
     srv = _reload_with_profile(monkeypatch, None)
     assert len(srv.TOOLS) == _TOTAL
 
@@ -59,7 +62,10 @@ def test_nav_profile_is_subset_of_core(monkeypatch):
     srv_nav = _reload_with_profile(monkeypatch, "nav")
     nav_names = {t.name for t in srv_nav.TOOLS}
     assert nav_names < core_names
-    assert nav_names == set(QFN_HANDLERS)
+    # nav = QFN handlers + ts_search (the discovery tool sits outside the
+    # handler groups but is intentionally exposed in nav so a stripped
+    # session can still reach hidden tools).
+    assert nav_names == set(QFN_HANDLERS) | {"ts_search"}
 
 
 def test_invalid_profile_falls_back_to_full(monkeypatch, capsys):

@@ -870,9 +870,18 @@ class ProjectQueryEngine:
         file_funcs = create_file_query_functions(meta)
         return file_funcs["get_lines"](start, end)
 
-    def get_functions(self, file_path: str | None = None, max_results: int = 0) -> list[dict]:
-        """Functions in a file, or all functions across the project."""
+    def get_functions(self, file_path: str | None = None, max_results: int = 100) -> list[dict]:
+        """Functions in a file, or all functions across the project.
+
+        Default cap: 100 rows. ``max_results=0`` restores "unlimited" but is
+        still bounded by the hard safety cap (1000 rows). Past observed
+        failure: project-wide call on a ~2 500-function repo returned a
+        180 k-char JSON that exceeded the MCP response token budget and
+        the agent saw an error instead of useful output.
+        """
         from token_savior.project_indexer import is_path_excluded_from_scans
+
+        _HARD_FUNCTION_CAP = 1000  # always enforced regardless of max_results
 
         if file_path is not None:
             meta = _resolve_file(self.index, file_path)
@@ -898,13 +907,43 @@ class ProjectQueryEngine:
                             "file": path,
                         }
                     )
-        if max_results > 0:
-            result = result[:max_results]
+        total = len(result)
+        # Resolve effective cap: explicit max_results wins; max_results=0 still
+        # honors the hard safety cap so the response never overflows.
+        effective_cap = (
+            max_results if (0 < max_results < _HARD_FUNCTION_CAP)
+            else _HARD_FUNCTION_CAP
+        )
+        if total > effective_cap:
+            result = result[:effective_cap]
+            hint = (
+                f"showing first {effective_cap} of {total}. Pass "
+                "file_path=<path> to scope, or query specific names via "
+                "find_symbol(names=[...])."
+            )
+            if max_results == 0 or max_results >= _HARD_FUNCTION_CAP:
+                hint = (
+                    f"hard cap {_HARD_FUNCTION_CAP} hit ({total} total). "
+                    + hint
+                )
+            result.append({
+                "_truncated": True,
+                "shown": effective_cap,
+                "total": total,
+                "hint": hint,
+            })
         return result
 
-    def get_classes(self, file_path: str | None = None, max_results: int = 0) -> list[dict]:
-        """Classes in a file or across the project."""
+    def get_classes(self, file_path: str | None = None, max_results: int = 100) -> list[dict]:
+        """Classes in a file or across the project.
+
+        Default cap: 100 rows. ``max_results=0`` means "unlimited" but is
+        still bounded by a hard safety cap (1000 rows) — see get_functions
+        for the same pattern and rationale.
+        """
         from token_savior.project_indexer import is_path_excluded_from_scans
+
+        _HARD_CLASS_CAP = 1000
 
         if file_path is not None:
             meta = _resolve_file(self.index, file_path)
@@ -931,12 +970,33 @@ class ProjectQueryEngine:
                             "file": path,
                         }
                     )
-        if max_results > 0:
-            result = result[:max_results]
+        total = len(result)
+        effective_cap = (
+            max_results if (0 < max_results < _HARD_CLASS_CAP)
+            else _HARD_CLASS_CAP
+        )
+        if total > effective_cap:
+            result = result[:effective_cap]
+            hint = (
+                f"showing first {effective_cap} of {total}. Pass "
+                "file_path=<path> to scope, or query specific names via "
+                "find_symbol(names=[...])."
+            )
+            if max_results == 0 or max_results >= _HARD_CLASS_CAP:
+                hint = f"hard cap {_HARD_CLASS_CAP} hit ({total} total). " + hint
+            result.append({
+                "_truncated": True,
+                "shown": effective_cap,
+                "total": total,
+                "hint": hint,
+            })
         return result
 
-    def get_imports(self, file_path: str | None = None, max_results: int = 0) -> list[dict]:
+    def get_imports(self, file_path: str | None = None, max_results: int = 100) -> list[dict]:
         """Imports in a file or across the project.
+
+        Default cap: 100 rows. Pass ``max_results=0`` to restore unlimited,
+        or ``file_path=<path>`` to scope.
 
         When a file is resolved but genuinely has no imports, returns a
         single descriptive marker entry (``_empty: True``) instead of a
@@ -976,8 +1036,18 @@ class ProjectQueryEngine:
                     "file": None,
                     "message": "no imports found in the indexed project",
                 }]
-        if max_results > 0:
+        total = len(result)
+        if max_results > 0 and total > max_results:
             result = result[:max_results]
+            result.append({
+                "_truncated": True,
+                "shown": max_results,
+                "total": total,
+                "hint": (
+                    f"showing first {max_results} of {total}. Pass "
+                    "max_results=0 for all, or file_path=<path> to scope."
+                ),
+            })
         return result
 
     def get_function_source(
@@ -1289,10 +1359,59 @@ class ProjectQueryEngine:
         return result
 
     def get_file_dependents(self, file_path: str, max_results: int = 0) -> list[str]:
-        """What files import from this file (from reverse_import_graph)."""
-        deps = self.index.reverse_import_graph.get(file_path)
+        """What files import from this file (from reverse_import_graph).
+
+        Tolerates the three common UX failures observed in production:
+        * absolute path passed when the index keys are project-relative
+        * Windows-style backslash separators
+        * the file exists in the index but has no inbound imports — return
+          an empty list with a ``_no_dependents`` marker instead of a hard
+          "not found" error so the agent doesn't think the tool broke.
+        """
+        # Normalize: project-relative + POSIX separators
+        normalized = file_path.replace("\\", "/")
+        if os.path.isabs(normalized):
+            # ProjectQueryEngine doesn't carry root_path; try common roots
+            # by stripping any registered project root prefix.
+            for known in self.index.files:
+                if normalized.endswith("/" + known):
+                    normalized = known
+                    break
+
+        deps = self.index.reverse_import_graph.get(normalized)
+        if deps is None and normalized != file_path:
+            deps = self.index.reverse_import_graph.get(file_path)
+
         if deps is None:
-            return [f"Error: '{file_path}' not found in reverse import graph"]
+            # File might be indexed but simply have no inbound imports
+            # (terminal modules, scripts, generated entrypoints).
+            file_indexed = (
+                normalized in self.index.files
+                or file_path in self.index.files
+            )
+            if file_indexed:
+                return [{
+                    "_no_dependents": True,
+                    "file": normalized,
+                    "hint": (
+                        "File is indexed but no other file imports it. "
+                        "This is normal for entrypoints, scripts, or "
+                        "leaf modules."
+                    ),
+                }]
+            # Suggest closest known file when path is wrong
+            import difflib
+            close = difflib.get_close_matches(
+                normalized, list(self.index.files.keys()), n=3, cutoff=0.6
+            )
+            suggestion = f" Did you mean: {', '.join(close)}?" if close else ""
+            return [{
+                "error": f"'{file_path}' not found in reverse import graph.{suggestion}",
+                "hint": (
+                    "If the file was added or moved recently, run reindex() "
+                    "first — the import graph is built at index time."
+                ),
+            }]
         result = sorted(deps)
         if max_results > 0:
             result = result[:max_results]
@@ -1304,19 +1423,42 @@ class ProjectQueryEngine:
         max_results: int = 100,
         max_line_chars: int = 160,
         ignore_generated: bool = True,
+        semantic: bool = False,
     ) -> list[dict]:
-        """Regex across all files, returns [{file, line_number, content}].
+        """Regex (default) or semantic search across project files.
 
-        Each hit's `content` is truncated to `max_line_chars` (default 160,
-        suffixed with "…") so verbose matches like long comment lines don't
-        explode the response. Pass 0 to disable truncation.
+        Regex mode (``semantic=False``) returns ``[{file, line_number,
+        content}]``. Each hit's `content` is truncated to
+        ``max_line_chars`` (default 160, suffixed with "…"). Pass 0 to
+        disable truncation.
 
         ``ignore_generated`` (default True) filters out files that are
-        typically auto-generated or minified — ``*.generated.*``, ``*.min.*``,
-        ``*.pb.*``, ``*.proto``, ``dist/``, ``build/``, ``.next/``,
-        ``node_modules/`` — so Prisma/proto schema lookups don't drown in
-        boilerplate hits. Pass False to scan everything.
+        typically auto-generated or minified — ``*.generated.*``,
+        ``*.min.*``, ``*.pb.*``, ``*.proto``, ``dist/``, ``build/``,
+        ``.next/``, ``node_modules/`` — so Prisma/proto schema lookups
+        don't drown in boilerplate hits. Pass False to scan everything.
+
+        Semantic mode (``semantic=True``) treats ``pattern`` as a natural
+        language description and returns the top-K matching symbols
+        (Python functions/classes/methods) by embedding cosine similarity.
+        Each hit carries ``{symbol, kind, file, line, score, signature,
+        docstring_head}`` for disambiguation. No low-confidence warning
+        is emitted — tests/benchmarks/code_retrieval showed that top1
+        score distributions overlap too much between correct and wrong
+        retrievals for any absolute-score warning to be informative
+        (12% precision / 25% recall at best-tuned thresholds). Agents
+        should always verify a semantic hit via ``find_symbol`` before
+        any destructive operation, regardless of score. **Never act on a semantic hit (call / edit / delete) without
+        verifying via ``find_symbol(exact_name)`` first** — semantic
+        near-misses are plausible by design.
+
+        First semantic call triggers a one-time embedding reindex of all
+        project symbols (~2 min for 1000 symbols on CPU). Subsequent calls
+        are fast (hash-based skip of unchanged symbols). Silent fallback
+        to an empty result list when the vector stack is unavailable.
         """
+        if semantic:
+            return self._search_codebase_semantic(pattern, max_results)
         from token_savior.project_indexer import is_path_excluded_from_scans
 
         try:
@@ -1381,6 +1523,54 @@ class ProjectQueryEngine:
                         if limit and len(results) >= limit:
                             return results
         return results
+
+    def _search_codebase_semantic(
+        self, pattern: str, max_results: int,
+    ) -> list[dict]:
+        """Semantic path of ``search_codebase``. Auto-reindexes symbols on
+        the first call per project, then runs a k-NN query. Returns a list
+        where the first item may be a ``{"warning": ...}`` dict followed
+        by hit dicts, mirroring the shape of the regex path (so both modes
+        stay uniform for JSON consumers).
+        """
+        try:
+            from token_savior.memory.symbol_embeddings import (
+                reindex_project_symbols,
+                search_symbols_semantic,
+            )
+        except ImportError as exc:
+            return [{"error": f"semantic search unavailable: {exc}"}]
+
+        root = self.index.root_path
+        limit = max(int(max_results), 5) if max_results else 10
+
+        reindex = reindex_project_symbols(root)
+        if reindex.get("status") != "ok":
+            return [{
+                "error": (
+                    f"semantic index unavailable: "
+                    f"{reindex.get('reason', 'unknown')}"
+                ),
+            }]
+
+        result = search_symbols_semantic(pattern, root, limit=limit)
+        if result.get("status") != "ok":
+            return [{"error": result.get("reason", "semantic search failed")}]
+
+        out: list[dict] = []
+        if result.get("warning"):
+            out.append({"warning": result["warning"]})
+        out.extend(result["hits"])
+        if reindex.get("indexed", 0) > 0 or reindex.get("removed", 0) > 0:
+            out.append({
+                "reindex_info": (
+                    f"indexed={reindex['indexed']} "
+                    f"skipped={reindex['skipped']} "
+                    f"removed={reindex['removed']} "
+                    f"elapsed_s={reindex['elapsed_s']}"
+                ),
+            })
+        return out
 
     def search_in_symbols(
         self,
@@ -1991,8 +2181,29 @@ class ProjectQueryEngine:
         min_lines: int = 2,
         max_groups: int = 30,
         max_members_per_group: int = 6,
+        method: str = "ast",
+        min_similarity: float = 0.90,
     ) -> str:
-        """Group functions whose AST-normalised hash collides.
+        """Group functions that do the same thing.
+
+        Two strategies:
+
+        * ``method="ast"`` (default, fast): group functions whose
+          AST-normalised hash collides. Catches copy-paste and minor
+          renames cleanly, misses conceptual clones rewritten from
+          scratch.
+        * ``method="embedding"`` (slower, requires Nomic stack):
+          rank every pair of functions by cosine similarity of their
+          embedding; emit clusters above ``min_similarity``. Each
+          cluster in the output carries a ``sim=min..mean`` tag so the
+          caller can triage tight clones vs loose conceptual matches.
+          Catches rewrites that AST hash can't see (reordered branches,
+          different variable names) but introduces false positives
+          around boilerplate — always cross-check via
+          ``get_function_source`` before merging. Reuses the
+          ``symbol_vectors`` index populated by
+          ``search_codebase(semantic=True)``; first call triggers a
+          reindex.
 
         *min_lines* skips trivial one-liner functions where collisions
         are noise (`return None`, getters, etc). Default 2 catches
@@ -2006,6 +2217,12 @@ class ProjectQueryEngine:
         clean 2-member clone is usually more actionable than a 20-way
         boilerplate cluster.
         """
+        if method == "embedding":
+            return self._find_semantic_duplicates_embedding(
+                min_similarity=min_similarity,
+                max_groups=max_groups,
+                max_members_per_group=max_members_per_group,
+            )
         if self._semantic_hash_cache is None:
             self._build_semantic_hash_cache(min_lines)
 
@@ -2031,6 +2248,180 @@ class ProjectQueryEngine:
                 lines.append(f"  hash {h}: {shown}, +{len(syms) - cap} more")
             else:
                 lines.append(f"  hash {h}: {', '.join(syms)}")
+        return "\n".join(lines)
+
+    def _find_semantic_duplicates_embedding(
+        self,
+        min_similarity: float,
+        max_groups: int,
+        max_members_per_group: int,
+    ) -> str:
+        """Embedding-based duplicate detection — clusters symbols whose
+        pairwise cosine similarity exceeds ``min_similarity``.
+
+        Uses a simple union-find over edges ``sim(a, b) >= threshold``
+        to collapse transitive clusters. On a 1000-symbol project the
+        pair enumeration is 500k comparisons; each is a cheap dot
+        product on normalised 768d vectors — runs in 1-2 seconds once
+        the index is warm. The real cost is the first-call reindex
+        (~2 min, same as ``search_codebase(semantic=True)``).
+        """
+        try:
+            from token_savior.memory.symbol_embeddings import (
+                reindex_project_symbols,
+            )
+            from token_savior import memory_db
+            import sqlite_vec  # noqa: F401  # loaded side-effect
+        except ImportError as exc:
+            return f"Semantic duplicates (embedding): unavailable ({exc})"
+
+        root = self.index.root_path
+        reindex = reindex_project_symbols(root)
+        if reindex.get("status") != "ok":
+            return (
+                "Semantic duplicates (embedding): unavailable "
+                f"({reindex.get('reason', 'unknown')})"
+            )
+
+        # Fetch every (symbol_id, symbol_key, embedding) for this project.
+        # sqlite-vec doesn't expose the raw float vector via the vec0 table
+        # once serialised, so we deserialise client-side.
+        import struct
+
+        with memory_db.db_session() as conn:
+            rows = conn.execute(
+                "SELECT s.id, s.symbol_key, s.kind, v.embedding "
+                "FROM symbols s JOIN symbol_vectors v ON v.symbol_id = s.id "
+                "WHERE s.project_root = ?",
+                (root,),
+            ).fetchall()
+
+        symbols: list[tuple[int, str, str, list[float]]] = []
+        for r in rows:
+            blob = bytes(r["embedding"])
+            if len(blob) % 4 != 0:
+                continue
+            n = len(blob) // 4
+            vec = list(struct.unpack(f"{n}f", blob))
+            symbols.append((r["id"], r["symbol_key"], r["kind"], vec))
+
+        # Collapse clusters via Union-Find: every edge whose cosine
+        # meets the threshold joins two nodes. For normalised vectors,
+        # cos(a, b) = dot(a, b).
+        parent = list(range(len(symbols)))
+
+        def _find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def _union(a: int, b: int) -> None:
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        def _is_container_member_pair(a_key: str, b_key: str) -> bool:
+            """True when one symbol is a direct member of the other
+            (e.g. ``pkg/x.py::Foo`` vs ``pkg/x.py::Foo.__init__``). The
+            embeddings are naturally close because both share the class
+            name, but structurally they're not clones — skip.
+            """
+            if "::" not in a_key or "::" not in b_key:
+                return False
+            a_file, a_qname = a_key.split("::", 1)
+            b_file, b_qname = b_key.split("::", 1)
+            if a_file != b_file:
+                return False
+            if a_qname == b_qname:
+                return True
+            return (
+                b_qname.startswith(a_qname + ".")
+                or a_qname.startswith(b_qname + ".")
+            )
+
+        threshold = float(min_similarity)
+        pairs_checked = 0
+        skipped_container = 0
+        # Record every above-threshold edge so we can expose per-cluster
+        # min/mean similarity in the output — safety contract #1 for the
+        # embedding duplicate path: "present pairs with score".
+        edges: list[tuple[int, int, float]] = []
+        for i in range(len(symbols)):
+            vi = symbols[i][3]
+            key_i = symbols[i][1]
+            for j in range(i + 1, len(symbols)):
+                key_j = symbols[j][1]
+                if _is_container_member_pair(key_i, key_j):
+                    skipped_container += 1
+                    continue
+                vj = symbols[j][3]
+                dot = 0.0
+                for a, b in zip(vi, vj, strict=True):
+                    dot += a * b
+                pairs_checked += 1
+                if dot >= threshold:
+                    _union(i, j)
+                    edges.append((i, j, dot))
+
+        # Materialise clusters of size >= 2, keyed by cluster root id.
+        clusters: dict[int, list[tuple[int, str]]] = {}
+        for i, (_, key, _, _) in enumerate(symbols):
+            root_id = _find(i)
+            clusters.setdefault(root_id, []).append((i, key))
+        # Per-cluster edge similarities (internal edges only).
+        cluster_sims: dict[int, list[float]] = {}
+        for a, b, sim in edges:
+            ra = _find(a)
+            cluster_sims.setdefault(ra, []).append(sim)
+
+        # Group as (members sorted by key, min_sim, mean_sim).
+        groups: list[tuple[list[str], float, float]] = []
+        for root_id, members in clusters.items():
+            if len(members) < 2:
+                continue
+            keys = sorted(k for _, k in members)
+            sims = cluster_sims.get(root_id, [])
+            if sims:
+                smin = min(sims)
+                smean = sum(sims) / len(sims)
+            else:
+                smin = smean = threshold
+            groups.append((keys, smin, smean))
+
+        if not groups:
+            return (
+                f"Semantic duplicates (embedding, sim>={threshold:.2f}): "
+                f"none found across {len(symbols)} symbols "
+                f"({pairs_checked} pairs checked)."
+            )
+
+        # Pairs first, then larger clusters, as in the AST path.
+        groups.sort(key=lambda g: (0 if len(g[0]) == 2 else 1, -len(g[0])))
+        total = len(groups)
+        groups = groups[:max_groups]
+
+        lines = [
+            f"Semantic duplicates (embedding, sim>={threshold:.2f}): "
+            f"{total} cluster(s) found across {len(symbols)} symbols "
+            f"(showing top {len(groups)})",
+            "WARNING: embedding matches can be conceptual but not functional."
+            " Verify with get_function_source before merging or deleting.",
+        ]
+        cap = max(2, max_members_per_group) if max_members_per_group > 0 else 0
+        for members, smin, smean in groups:
+            score_tag = f"sim={smin:.2f}..{smean:.2f}"
+            if cap and len(members) > cap:
+                shown = ", ".join(members[:cap])
+                lines.append(
+                    f"  cluster({len(members)}) {score_tag}: "
+                    f"{shown}, +{len(members) - cap} more"
+                )
+            else:
+                lines.append(
+                    f"  cluster({len(members)}) {score_tag}: "
+                    f"{', '.join(members)}"
+                )
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
