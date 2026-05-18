@@ -2,6 +2,11 @@
 # Memory Engine — UserPromptSubmit hook
 # - synchronous: inject top-3 relevant observations into context (stdout)
 # - background: strip private tags, trigger phrases, archive prompt
+#
+# TS_MEMORY_DISABLE=1 -> short-circuit (tsbench / clean ctx workloads).
+if [ "$TS_MEMORY_DISABLE" = "1" ]; then
+    exit 0
+fi
 
 # -- token-savior hook error log (see GitHub #15) ---------------------------
 # Re-routes stderr from Python / claude sub-shells so a broken import, a
@@ -31,13 +36,13 @@ if [ -n "$_REDACTED" ]; then
 fi
 
 # --- Synchronous injection (must complete before Claude responds) ---------
-/root/.local/token-savior-venv/bin/python3 -c "
+printf '%s' "$PAYLOAD" | /root/.local/token-savior-venv/bin/python3 -c "
 import sys, json, re
 sys.path.insert(0, '/root/token-savior/src')
 from token_savior import memory_db
 
 try:
-    payload = json.loads('''$PAYLOAD''')
+    payload = json.loads(sys.stdin.read())
     text = (payload.get('prompt') or '').strip()
     if len(text) < 20:
         sys.exit(0)
@@ -92,13 +97,13 @@ except Exception:
 " 2>>"$ERR_LOG"
 
 # --- Reasoning Trace injection (synchronous) -----------------------------
-/root/.local/token-savior-venv/bin/python3 -c "
+printf '%s' "$PAYLOAD" | /root/.local/token-savior-venv/bin/python3 -c "
 import sys, json
 sys.path.insert(0, '/root/token-savior/src')
 from token_savior import memory_db
 
 try:
-    payload = json.loads('''$PAYLOAD''')
+    payload = json.loads(sys.stdin.read())
     text = (payload.get('prompt') or '').strip()
     if len(text) < 20:
         sys.exit(0)
@@ -117,13 +122,13 @@ except Exception:
 " 2>>"$ERR_LOG"
 
 # --- Session mode auto-detection (synchronous, write override file) ------
-/root/.local/token-savior-venv/bin/python3 -c "
+printf '%s' "$PAYLOAD" | /root/.local/token-savior-venv/bin/python3 -c "
 import sys, json, re
 sys.path.insert(0, '/root/token-savior/src')
 from token_savior import memory_db
 
 try:
-    payload = json.loads('''$PAYLOAD''')
+    payload = json.loads(sys.stdin.read())
     text = (payload.get('prompt') or '').strip()
     if len(text) < 3:
         sys.exit(0)
@@ -146,12 +151,12 @@ except Exception:
 " 2>>"$ERR_LOG"
 
 # --- Background: archive + trigger phrases --------------------------------
-/root/.local/token-savior-venv/bin/python3 -c "
+printf '%s' "$PAYLOAD" | /root/.local/token-savior-venv/bin/python3 -c "
 import sys, json, re
 sys.path.insert(0, '/root/token-savior/src')
 from token_savior import memory_db
 
-payload = json.loads('''$PAYLOAD''')
+payload = json.loads(sys.stdin.read())
 text = payload.get('prompt', '')
 if len(text) < 10:
     sys.exit(0)

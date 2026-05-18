@@ -607,7 +607,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "set_project_root": {
         "description": (
-        'Register a new project root and switch to it.'
+        'Register a new project root and switch to it. If the path is already '
+        'registered, this becomes a cheap active-root switch (no reindex) '
+        'unless force=true is set.'
     ),
         "inputSchema": {
             "type": "object",
@@ -615,6 +617,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 "path": {
                     "type": "string",
                     "description": "Absolute path to the project root directory.",
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Rebuild the index even if the project is already registered.",
                 },
             },
             "required": ["path"],
@@ -1166,12 +1172,36 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     # ── Defer-loading router (lets thin manifests pull tool schemas just-in-time) ──
+    "ts_execute": {
+        "description": (
+            "Run a JS script in a Node sandbox with a typed facade. The script body "
+            "executes as `async () => { <body> }`; use `await tools.<name>(args)` to "
+            "call any allowed tool (find_symbol, get_function_source, get_dependents, "
+            "search_codebase, replace_symbol_source, etc.). Return the final value. "
+            "Collapses find->read->deps chains into one round-trip."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "script": {
+                    "type": "string",
+                    "description": "JS function body. Use `await tools.foo(args)` then `return value`.",
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Max script wall-clock in ms (default 30000).",
+                },
+            },
+            "required": ["script"],
+        },
+    },
     "ts_search": {
         "description": (
             "Find the top-K Token Savior tools most relevant to a natural-language "
             "query via embedding cosine similarity. Use when the manifest is in 'tiny' "
-            "profile or you don't know which tool fits. Returns each candidate with "
-            "its full inputSchema so the next turn can call it directly."
+            "or 'code_mode' profile or you don't know which tool fits. Returns each "
+            "candidate with its full inputSchema (format='schema') or a one-line "
+            "TypeScript signature (format='ts') suitable for ts_execute scripts."
         ),
         "inputSchema": {
             "type": "object",
@@ -1187,6 +1217,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 "include_schema": {
                     "type": "boolean",
                     "description": "If false, drop inputSchema from the response (smaller payload).",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["schema", "ts"],
+                    "description": "'schema' (default) returns JSONSchema; 'ts' returns a TypeScript signature for Code Mode scripts. Auto-set to 'ts' when profile=code_mode.",
                 },
             },
             "required": ["query"],

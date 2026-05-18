@@ -47,9 +47,14 @@ import time
 import traceback
 from typing import Any
 
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
-import mcp.types as types
+# MCP imports : tous deferred a `run()`. Le import `mcp.types` declenche
+# `import mcp` qui charge tout le SDK (uvicorn, sse_starlette, fastmcp) ~800ms
+# cold start. Inacceptable pour la CLI fork-mode et les scripts qui importent
+# `_dispatch_tool`. On utilise les shims locaux (token_savior._compat) :
+# `TextContent` / `Tool` / `types` duck-type. Le serveur MCP convertit aux
+# vrais types `mcp.types.*` UNIQUEMENT a la frontiere protocole (list_tools,
+# call_tool), une fois par appel, sans pollution du cold-start des handlers.
+from token_savior._compat import TextContent, Tool, types  # type: ignore
 
 from token_savior import memory_db
 from token_savior import server_state as s
@@ -78,7 +83,11 @@ from token_savior.server_runtime import (
     _warm_cache_async,
     compress_symbol_output,
 )
-from token_savior.server_state import server
+# `from token_savior.server_state import server` declenchait
+# __getattr__('server') qui faisait lazy import de mcp.server (1.24s SDK).
+# On retire l import au top et on accede a `s.server` UNIQUEMENT dans run()
+# qui est le seul site de l acces. Les decorateurs sont appliques en runtime
+# dans run() egalement.
 from token_savior.slot_manager import _ProjectSlot  # noqa: F401  -- re-export for tests/test_usage_stats.py
 
 # Called once at module import so slots exist before any tool call.
@@ -99,7 +108,39 @@ except Exception as _viewer_exc:  # pragma: no cover — defensive
 
 from token_savior.tool_schemas import TOOL_SCHEMAS  # noqa: E402
 
-TOOLS = [Tool(name=name, description=s["description"], inputSchema=s["inputSchema"])
+
+def _thin_input_schema(schema: dict) -> dict:
+    """Retire les `description` des sub-properties de l inputSchema.
+
+    Sur le profile tiny_plus, mesure : 9915 chars -> 5563 chars (-44%, -1209
+    tokens) sur le manifest. La description top-level du tool reste, ce qui
+    suffit dans 95% des cas pour que le model invoque correctement -- les
+    sub-prop descriptions sont du bruit JSON-Schema verbose.
+
+    Opt-in via TS_THIN_SCHEMAS=1. Recommande sur les profiles bench et les
+    setups Claude Code OAuth (compte Max) ou chaque token de manifest est
+    re-cache a chaque turn.
+    """
+    import copy
+    s = copy.deepcopy(schema)
+    props = s.get("properties", {})
+    for pdef in props.values():
+        pdef.pop("description", None)
+        if isinstance(pdef.get("items"), dict):
+            pdef["items"].pop("description", None)
+    return s
+
+
+_THIN_SCHEMAS = os.environ.get("TS_THIN_SCHEMAS") == "1"
+
+
+def _schema_for(s: dict) -> dict:
+    return _thin_input_schema(s["inputSchema"]) if _THIN_SCHEMAS else s["inputSchema"]
+
+
+# TOOLS = liste de ToolDef (shim local). Le serveur MCP convertit en
+# mcp.types.Tool a la frontiere protocole, dans list_tools().
+TOOLS = [Tool(name=name, description=s["description"], inputSchema=_schema_for(s))
          for name, s in TOOL_SCHEMAS.items()]
 
 
@@ -234,15 +275,79 @@ _TINY_PLUS_INCLUDES: set[str] = _TINY_INCLUDES | {
     "replace_symbol_source",
 }
 
+# `code_mode` = single-shot multi-tool execution via ts_execute. Manifest
+# is 4 tools (~1.5 KT) plus a per-call typed TS facade returned by
+# ts_search. Model discovers tool signatures on demand; scripts run in
+# one round-trip instead of N. Mirrors the Cloudflare Code Mode pattern.
+_CODE_MODE_INCLUDES: set[str] = {
+    "ts_execute",
+    "ts_search",
+    "switch_project",
+    "list_projects",
+}
+
+# `auto` = adaptive profile built from telemetry. Three layers:
+#   1. Hot core: top-K from persistent tool_call_counts (LinUCB feature
+#      vector falls back to raw counts when the model is under-trained).
+#   2. Always-on essentials: switch_project, list_projects, get_git_status.
+#   3. Discovery: ts_search (defer-loading) + ts_execute (Code Mode bridge).
+# Total manifest ~2-3 KT, converges to the user's actual usage after a
+# handful of sessions. Defaults to TINY_PLUS_INCLUDES on cold start
+# (no telemetry yet) to avoid a bad first-session experience.
+_AUTO_HOT_K = int(os.environ.get("TS_AUTO_HOT_K", "10"))
+_AUTO_ESSENTIALS: set[str] = {
+    "switch_project",
+    "list_projects",
+    "get_git_status",
+    "ts_search",
+    "ts_execute",
+}
+
+
+def _auto_includes() -> set[str]:
+    """Compute the auto-profile tool set from telemetry.
+
+    Pure function so callers (tests, debug commands) can introspect what
+    the runtime will expose without re-importing the server module.
+    """
+    try:
+        from token_savior import telemetry as _t
+        counts = _t.aggregate_counts()
+    except Exception:
+        counts = {}
+    # Filter out tools that aren't in TOOL_SCHEMAS (renamed/removed in
+    # earlier versions but still in old telemetry files).
+    eligible = {t: n for t, n in counts.items() if t in TOOL_SCHEMAS}
+    if not eligible:
+        # Cold start: borrow tiny_plus as the warm baseline.
+        return set(_AUTO_ESSENTIALS) | set(_TINY_PLUS_INCLUDES)
+    # Top-K by call count, excluding tools already in essentials.
+    ranked = sorted(eligible.items(), key=lambda kv: -kv[1])
+    hot: list[str] = []
+    for name, _n in ranked:
+        if name in _AUTO_ESSENTIALS:
+            continue
+        hot.append(name)
+        if len(hot) >= _AUTO_HOT_K:
+            break
+    return set(_AUTO_ESSENTIALS) | set(hot)
+
+
 _PROFILE_EXCLUDES: dict[str, set[str]] = {
     "full": set(),
+    "auto": set(TOOL_SCHEMAS) - _auto_includes(),
     "core": set(_MEMORY_HANDLERS) | set(_META_HANDLERS),
-    "nav":  set(_MEMORY_HANDLERS) | set(_META_HANDLERS) | set(_SLOT_HANDLERS),
+    "nav":  set(_MEMORY_HANDLERS) | set(_META_HANDLERS) | set(_SLOT_HANDLERS) | {"ts_execute"},
     "lean": _LEAN_EXCLUDES,
     "ultra": set(TOOL_SCHEMAS) - _ULTRA_INCLUDES,
     "tiny": set(TOOL_SCHEMAS) - _TINY_INCLUDES,
     "tiny_plus": set(TOOL_SCHEMAS) - _TINY_PLUS_INCLUDES,
+    "code_mode": set(TOOL_SCHEMAS) - _CODE_MODE_INCLUDES,
 }
+
+# Profiles slated for removal in 4.0.0 — superseded by the single adaptive
+# `auto` profile that uses real telemetry instead of hand-tuned subsets.
+_DEPRECATED_PROFILES: set[str] = {"core", "nav", "lean", "ultra", "tiny", "tiny_plus"}
 
 _PROFILE = os.environ.get("TOKEN_SAVIOR_PROFILE", "full").lower()
 if _PROFILE not in _PROFILE_EXCLUDES:
@@ -251,6 +356,15 @@ if _PROFILE not in _PROFILE_EXCLUDES:
         file=sys.stderr,
     )
     _PROFILE = "full"
+
+if _PROFILE in _DEPRECATED_PROFILES:
+    print(
+        f"[token-savior] DEPRECATED: profile '{_PROFILE}' is deprecated and "
+        f"will be removed in v4.0.0. Use TOKEN_SAVIOR_PROFILE=auto for an "
+        f"adaptive manifest sized from your actual usage, or "
+        f"TOKEN_SAVIOR_PROFILE=full to keep every tool advertised.",
+        file=sys.stderr,
+    )
 
 _HIDDEN_UNDER_ULTRA: set[str] = _PROFILE_EXCLUDES["ultra"]
 
@@ -318,6 +432,12 @@ if _PROFILE == "ultra":
         },
     ))
 
+# Code Mode (ts_execute) is built from TOOL_SCHEMAS like every other tool;
+# the only special handling is the env-gated removal below for sandboxed
+# deployments that don't want a Node subprocess available.
+if os.environ.get("TS_CODE_MODE_DISABLE") == "1":
+    TOOLS = [t for t in TOOLS if t.name != "ts_execute"]
+
 print(
     f"[token-savior] profile={_PROFILE} tools={len(TOOLS)}/{len(TOOL_SCHEMAS)}",
     file=sys.stderr,
@@ -340,9 +460,14 @@ if "TOKEN_SAVIOR_PROFILE" not in os.environ and _PROFILE == "full":
 # ---------------------------------------------------------------------------
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    return TOOLS
+async def list_tools() -> list:
+    """MCP list_tools handler. Decorateur applique dans `run()` lazily."""
+    # Convertit nos ToolDef locaux en mcp.types.Tool a la frontiere protocole.
+    from mcp.types import Tool as McpTool
+    return [
+        McpTool(name=t.name, description=t.description, inputSchema=t.inputSchema)
+        for t in TOOLS
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -521,11 +646,15 @@ def _handle_ts_search(arguments: dict[str, Any]) -> list[types.TextContent]:
     """
     import json as _json
     visible = {t.name for t in TOOLS}
+    fmt = arguments.get("format")
+    if fmt is None and _PROFILE == "code_mode":
+        fmt = "ts"
     payload = _ts_search_impl(
         arguments.get("query") or "",
         top_k=arguments.get("top_k", 5),
         include_schema=arguments.get("include_schema", True),
         visible_tools=visible,
+        format=fmt or "schema",
     )
     return [TextContent(type="text", text=_json.dumps(payload, indent=2))]
 
@@ -575,6 +704,43 @@ def _handle_ts_extended(arguments: dict[str, Any]) -> list[types.TextContent]:
     )]
 
 
+async def _handle_ts_execute(arguments: dict[str, Any]) -> list[types.TextContent]:
+    """Run a user JS script in a Node sandbox.
+
+    Each `tools.<name>(args)` call from the script is dispatched back through
+    `_dispatch_tool` and JSON-serialized for the JS side. The script's return
+    value becomes the tool result.
+    """
+    import json as _json
+    from token_savior.code_mode import ALLOWED_TOOLS, run_script_async
+
+    script = arguments.get("script") or ""
+    if not script.strip():
+        return [TextContent(type="text", text="Error: 'script' is required and non-empty")]
+    timeout_ms = int(arguments.get("timeout_ms") or 30000)
+
+    def _dispatch_from_sandbox(tool_name: str, tool_args: dict) -> Any:
+        """Bridge: take a JS-side tool call, run Python dispatch, return JS-friendly value."""
+        record_symbol = _track_call(tool_name, tool_args)
+        result = _dispatch_tool(tool_name, tool_args, record_symbol)
+        text = "".join(part.text for part in result if hasattr(part, "text"))
+        stripped = text.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                return _json.loads(stripped)
+            except _json.JSONDecodeError:
+                pass
+        return text
+
+    outcome = await run_script_async(
+        script=script,
+        allowed_tools=ALLOWED_TOOLS,
+        dispatch=_dispatch_from_sandbox,
+        timeout_ms=timeout_ms,
+    )
+    return [TextContent(type="text", text=_json.dumps(outcome, indent=2, default=str))]
+
+
 # Request lifecycle logging is opt-in via TOKEN_SAVIOR_TRACE=1.
 # Issue #27: gives operators (especially on Windows where MCP requests
 # can hang or abort) a way to see start / dispatch / complete events
@@ -582,23 +748,28 @@ def _handle_ts_extended(arguments: dict[str, Any]) -> list[types.TextContent]:
 _TRACE_REQUESTS = os.environ.get("TOKEN_SAVIOR_TRACE", "").lower() in ("1", "true", "yes")
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+async def call_tool(name: str, arguments: dict[str, Any]) -> list:
 
-    start = time.monotonic() if _TRACE_REQUESTS else 0.0
+    # Latency instrumentation: always record, regardless of TOKEN_SAVIOR_TRACE.
+    # Wall-clock cost measured at <1ms per call (see tests/test_latency.py).
+    _lat_start = time.monotonic()
     if _TRACE_REQUESTS:
         print(f"[token-savior] -> call {name}", file=sys.stderr, flush=True)
 
     record_symbol = _track_call(name, arguments)
+    _lat_status = "ok"
+    _lat_err: str | None = None
     try:
         if name == "ts_extended":
             result = _handle_ts_extended(arguments)
         elif name == "ts_search":
             result = _handle_ts_search(arguments)
+        elif name == "ts_execute":
+            result = await _handle_ts_execute(arguments)
         else:
             result = _dispatch_tool(name, arguments, record_symbol)
         if _TRACE_REQUESTS:
-            elapsed_ms = (time.monotonic() - start) * 1000.0
+            elapsed_ms = (time.monotonic() - _lat_start) * 1000.0
             print(
                 f"[token-savior] <- ok   {name} ({elapsed_ms:.0f}ms)",
                 file=sys.stderr,
@@ -607,8 +778,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         return result
 
     except Exception as e:
+        _lat_status = "err"
+        _lat_err = type(e).__name__
         if _TRACE_REQUESTS:
-            elapsed_ms = (time.monotonic() - start) * 1000.0
+            elapsed_ms = (time.monotonic() - _lat_start) * 1000.0
             print(
                 f"[token-savior] <- err  {name} ({elapsed_ms:.0f}ms) {type(e).__name__}: {e}",
                 file=sys.stderr,
@@ -616,6 +789,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             )
         print(f"[token-savior] Error in {name}: {traceback.format_exc()}", file=sys.stderr)
         return [TextContent(type="text", text=f"Error: {e}")]
+
+    finally:
+        # Fire-and-forget persistence. The latency module is silent on
+        # every failure, but guard the import + active-project lookup too.
+        try:
+            from token_savior import latency as _latency
+            _elapsed_ms = int((time.monotonic() - _lat_start) * 1000.0)
+            try:
+                _root = s._slot_mgr.active_root
+                _project = os.path.basename(_root) if _root else None
+            except Exception:
+                _project = None
+            _latency.record(name, _project, _elapsed_ms, _lat_status, _lat_err)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +817,14 @@ async def main():
     memory_db.run_migrations()
     if _TRACE_REQUESTS:
         print("[token-savior] startup: opening stdio transport", file=sys.stderr, flush=True)
+    # Lazy : Server() instancie ici, applique les decorateurs sur nos
+    # handlers list_tools/call_tool, puis demarre. Tout le mcp.* import
+    # est confine a ce point d entree -- les clients CLI (qui importent
+    # _dispatch_tool depuis le module) ne payent jamais ce cout.
+    from mcp.server.stdio import stdio_server
+    server = s.get_server()
+    server.list_tools()(list_tools)
+    server.call_tool()(call_tool)
     async with stdio_server() as (read_stream, write_stream):
         if _TRACE_REQUESTS:
             print("[token-savior] startup: server.run loop entered", file=sys.stderr, flush=True)
