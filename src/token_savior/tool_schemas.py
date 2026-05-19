@@ -640,6 +640,47 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": ["keyword"],
         },
     },
+    # ── Discover (transcript scan for missed TS opportunities) ────────────
+    "ts_discover": {
+        "description": (
+            "Scan Claude Code transcripts for missed Token Savior opportunities "
+            "(native-call chains that should have been a single TS call) and/or "
+            "report TS-vs-native adoption ratios. Scans ALL transcript projects "
+            "by default; pass project=<substring> to filter. format='table' "
+            "(default) or 'json' returns ranked Findings; format='adoption' or "
+            "'adoption_json' returns the TS adoption summary with trend + worst "
+            "sessions. Read-only, PII-safe."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since_days": {
+                    "type": "integer",
+                    "description": "Only consider events newer than now - since_days (default 7).",
+                },
+                "project": {
+                    "type": "string",
+                    "description": (
+                        "Filter to sanitized project dirs whose name contains this substring "
+                        "(e.g. '-root'). Omit to scan ALL transcript projects under "
+                        "~/.claude/projects/."
+                    ),
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["table", "json", "adoption", "adoption_json"],
+                    "description": (
+                        "Output format. 'table' (default) / 'json' = ranked missed-opportunity "
+                        "Findings. 'adoption' / 'adoption_json' = TS vs native adoption summary."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Cap the number of findings returned (table/json only; default unlimited).",
+                },
+            },
+        },
+    },
     # ── Stats (unified) ───────────────────────────────────────────────────
     "get_stats": {
         "description": (

@@ -32,6 +32,22 @@ Env vars:
                                  instructing the agent to ignore the raw inline output
                                  and use capture_get on the URI instead. Useful in
                                  tight context budgets.
+  TS_BASH_COMPACT             -- set to "1" to run Bash output through the
+                                 ``token_savior.compactors`` registry BEFORE the
+                                 sandbox decision. If a compactor matches and the
+                                 result is smaller than the original, the compact
+                                 text is emitted inline via additionalContext. In
+                                 hybrid mode (v4.2), if the compact result is itself
+                                 large (> TS_COMPACT_INLINE_THRESHOLD), the full
+                                 original output is also sandboxed and a
+                                 ``ts://capture/N`` ref is appended to the compact
+                                 preview. Off by default for backward compat.
+  TS_COMPACT_INLINE_THRESHOLD -- compact-result size (bytes) above which the
+                                 full original output is ALSO sandboxed and a
+                                 ts://capture ref is appended (default 4096).
+  TS_COMPACT_TINY_THRESHOLD   -- compact-result size (bytes) below which the
+                                 hybrid path never sandboxes — compact emitted
+                                 alone, regardless of original size (default 256).
 """
 from __future__ import annotations
 
@@ -44,6 +60,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 THRESHOLD = int(os.environ.get("TS_CAPTURE_THRESHOLD_BYTES", "4096"))
+COMPACT_INLINE_THRESHOLD = int(os.environ.get("TS_COMPACT_INLINE_THRESHOLD", "4096"))
+COMPACT_TINY_THRESHOLD = int(os.environ.get("TS_COMPACT_TINY_THRESHOLD", "256"))
 
 
 def _empty_pass() -> None:
@@ -80,6 +98,70 @@ def main() -> None:
             content = json.dumps(content, default=str)
         except Exception:
             content = str(content)
+
+    # Optional Bash compaction: try to render a token-efficient version of the
+    # output BEFORE the sandbox path. If a known compactor matches we emit the
+    # compact text inline and skip the sandbox entirely.
+    if (
+        tool_name == "Bash"
+        and os.environ.get("TS_BASH_COMPACT") == "1"
+        and content
+    ):
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+            from token_savior.compactors import compact as _compact
+            tool_input = event.get("tool_input") or {}
+            command = (tool_input.get("command") or "") if isinstance(tool_input, dict) else ""
+            stderr = response.get("stderr") if isinstance(response, dict) else ""
+            stderr = stderr if isinstance(stderr, str) else ""
+            result = _compact(command, content, stderr)
+        except Exception as exc:
+            sys.stderr.write(f"[ts-capture-hook] compact failed: {exc}\n")
+            result = None
+        if result is not None and result.compact_bytes < result.original_bytes:
+            inline_thr = int(os.environ.get("TS_COMPACT_INLINE_THRESHOLD", str(COMPACT_INLINE_THRESHOLD)))
+            tiny_thr = int(os.environ.get("TS_COMPACT_TINY_THRESHOLD", str(COMPACT_TINY_THRESHOLD)))
+            cmd_head = command.split()[0] if command else "bash"
+            base_note = (
+                f"[token-savior:compact] {cmd_head} "
+                f"output {result.original_bytes}B -> {result.compact_bytes}B "
+                f"({result.savings_pct:.0f}% saved). Compact rendering:\n"
+                f"{result.text}"
+            )
+            # Hybrid mode: if the compact result itself is large, ALSO sandbox
+            # the full original so the model can pull details on demand. Tiny
+            # results skip the sandbox unconditionally.
+            if result.compact_bytes > inline_thr and result.compact_bytes > tiny_thr:
+                try:
+                    from token_savior.memory import tool_capture as _tc
+                    args_summary = json.dumps(event.get("tool_input") or {}, default=str)[:300]
+                    original_text = result.original_text or content
+                    sb = _tc.capture_put(
+                        tool_name=tool_name,
+                        output=original_text,
+                        args_summary=args_summary,
+                        session_id=event.get("session_id"),
+                        project_root=event.get("cwd"),
+                        meta={"hook": "PostToolUse", "mode": "hybrid"},
+                    )
+                    cap_id = sb.get("id")
+                except Exception as exc:
+                    sys.stderr.write(f"[ts-capture-hook] hybrid sandbox failed: {exc}\n")
+                    cap_id = None
+                if cap_id:
+                    base_note += (
+                        f"\n(full output sandboxed to ts://capture/{cap_id} "
+                        f"— use capture_get to retrieve)"
+                    )
+            print(json.dumps({
+                "continue": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": base_note,
+                },
+            }))
+            return
+
     if len(content) < THRESHOLD:
         _empty_pass()
         return

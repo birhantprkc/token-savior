@@ -1,5 +1,119 @@
 # Changelog
 
+## v4.3.0 — Bench-driven coverage push (2026-05-19)
+
+Real-world bench against 7 days of Louis's transcripts (1130 Bash outputs)
+showed v4.2.0 only matched 11.9% of commands. v4.3.0 closes the gaps
+identified by the bench. Full suite: **1688 passed, 55 skipped**.
+
+### New
+
+- **F3a — fix `pytest` regex + git/gh extras.** `PytestCompactor` now
+  matches `python3 -m pytest`, `python -m pytest`, venv-prefixed forms,
+  and `uv/poetry/hatch/pdm/rye run pytest`. Five new git compactors
+  (`fetch`, `checkout`, `branch`, `worktree list`, `stash list`). Four new
+  gh compactors (`gh repo view`, `gh pr view`, `gh issue view`,
+  `gh pr diff` — last reuses `GitDiffCompactor` internals). Existing
+  `GitPushPull`/`GitAdd` matchers narrowed to release `fetch`/`checkout`
+  to the dedicated compactors.
+- **F3b — `grep` + `find` + `cat` compactors.** GrepCompactor groups
+  `file:line:rest` hits by filename, 83% savings on a 100-line fixture.
+  FindCompactor strips common prefix + head/tail truncation, 96% on a
+  300-file fixture. CatCompactor truncates long file dumps, 92% on a
+  500-line fixture. All bail on shell composition (pipes, `&&`, `;`).
+- **F3c — compound command splitting.** When a command like
+  `cd /root/foo && git status` doesn't match any compactor as-is, the
+  dispatcher now calls `pick_meaningful_segment()` and re-runs the
+  registry against the last meaningful segment. Bails conservatively
+  on subshells, heredocs, pipes, loops, unterminated quotes. Pure
+  stdlib state-machine parser.
+
+### Tests
+
++85 tests across the three feature lines. Full suite **1688 passed**.
+
+### Expected real-world impact
+
+Based on the same 7-day bench window, projected savings should rise from
+~12 K tokens/week to ~25 K tokens/week (3-4× v4.2.0 baseline). Re-bench
+after a few days of live usage to confirm.
+
+## v4.2.0 — Compactor coverage + hybrid mode + ts init (2026-05-19)
+
+Five parallel feature lines on top of v4.1.0, all green (1603 passed,
+55 skipped).
+
+### New
+
+- **F1a — test/lint compactors** (`compactors/{jest,vitest,eslint,biome}.py`).
+  Savings 58 % (eslint) to 95 % (jest all-green collapses to one line).
+- **F1b — cloud/package compactors** (`compactors/{kubectl,aws,pkg_list,curl}.py`).
+  12 new compactors: `kubectl get/logs`, `aws sts/ec2/lambda/logs/iam/dynamodb/s3`,
+  `npm/yarn/pnpm list`, `pip list/show`, `curl`. Peaks: 91.7 % `aws ec2`,
+  89.1 % `npm list`, 87.9 % `aws lambda`. DynamoDB type-tag unwrap so the
+  agent gets plain JSON.
+- **F2-hybrid — sandbox+compact dual-mode** (`hooks/tool_capture_hook.py`,
+  `compactors/base.py`). When a compactor matches but the compact text is
+  still bulky (> `TS_COMPACT_INLINE_THRESHOLD`, default 4 KB), the hook
+  emits the compact preview AND sandboxes the full original so the model
+  can fetch it via `capture_get` if needed. Small results stay inline-only
+  (legacy behavior). Tiny results (≤ `TS_COMPACT_TINY_THRESHOLD`, default
+  256 B) skip the sandbox path entirely.
+- **F3 — `ts init` CLI** (`src/token_savior/cli_init/`). New subcommand:
+  `ts init --agent {claude,cursor,gemini,codex} [--global] [--dry-run]
+  [--yes]`. Detects agent settings, deep-merges the hook config,
+  preserves existing hooks, dedups by `(matcher, command)`, prints a
+  unified diff, backs up `settings.json` to `.bak-YYYYMMDD-HHMMSS` (UTC),
+  idempotent on re-run.
+- **F4-all — `ts_discover` cross-project + adoption mode** (`discover/`,
+  `server_handlers/discover.py`, `tool_schemas.py`). Semantic change:
+  `project=None` now means "scan ALL transcript projects" (was: active
+  only). Each Finding gains `top_projects: dict[str,int]`. New
+  `format="adoption"` / `"adoption_json"` reports TS vs native ratios
+  per session, overall, with first-half/second-half trend and the 5
+  worst-ratio sessions.
+
+### Tests
+
++75 new tests across the five features. Full suite: **1603 passed**.
+
+## v4.1.0 — RTK-inspired Bash compaction + discover (2026-05-19)
+
+Four parallel feature lines, all green (1528 passed, 55 skipped):
+
+### New
+
+- **F1 — Bash output compactors** (`src/token_savior/compactors/`). 14
+  compactors for `git status/diff/log/push/commit/add`, `pytest`, `cargo
+  test/build/clippy`, `tsc`, `docker ps/logs`, `gh run list/view`.
+  Median savings 63 %, peak 100 % (`pytest -q` all-pass collapses to one
+  line). Wired into the existing `tool_capture` PostToolUse hook behind
+  `TS_BASH_COMPACT=1` (default off, no impact on existing users).
+- **F2 — PreToolUse Bash command rewriter** (`hooks/bash_rewriter_hook.py`,
+  `src/token_savior/bash_rewriter/`). Rewrites bare commands into denser
+  variants before execution: `git status` → `--porcelain=v2 --branch`,
+  `tsc` → `--pretty false`, `pytest` → `-q --tb=line`, etc. 10 safe rules,
+  guarded against composition operators and explicit verbose flags.
+  Gated on `TS_BASH_REWRITE=1`. Optional audit log via
+  `TS_BASH_REWRITE_LOG=/path/to/log.jsonl`.
+- **F3 — `get_usage_stats` v2** (`src/token_savior/server_handlers/stats.py`,
+  `stats_render.py`). ASCII sparkline (30 d), daily breakdown table (7 d),
+  top-tools cumulative (proportional attribution), session-vs-previous
+  delta. New kwargs `days`, `daily`, `format` (`text` / `json`). Backward
+  compat preserved.
+- **F4 — `ts_discover`** (`src/token_savior/server_handlers/discover.py`,
+  `src/token_savior/discover/`). New MCP tool that scans
+  `~/.claude/projects/*/*.jsonl` transcripts for missed TS opportunities:
+  Read→Grep→Read chains, sequential `find_symbol`, edit without
+  `get_edit_context`, `memory_search` without prior `memory_index`,
+  native shell on code files. Streams JSONL, mtime fast-skip, args pruned
+  to load-bearing keys (PII-safe). 30-day scan in ~2.5 s on a 343 MB
+  transcript dir.
+
+### Tests
+
++105 new tests across the four features. Full suite 1528 passed.
+
 ## v3.0.0 — PyPI catch-up release (2026-04-30)
 
 First PyPI release since v2.6.0 (2026-04-20). Bundles every accumulated
