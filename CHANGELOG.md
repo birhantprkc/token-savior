@@ -1,5 +1,66 @@
 # Changelog
 
+## v4.4.1 — Chain nudge covers get_function_source -> get_full_context (2026-05-26)
+
+Extend the chain-nudge detector to cover the dominant remaining wasteful
+pattern: `get_function_source(X)` / `get_class_source(X)` followed by
+`get_full_context(X)` within 60s. 9-day usage data showed **187 occurrences**
+(vs 42 for the find-then-read pattern already covered in v4.4.0). The first
+read is wasted -- `get_full_context` re-fetches the source as part of its
+bundle. Nudge fires at top of payload: "start with get_full_context next time."
+
+Test fixture also snapshots `_tool_call_counts` so chain-nudge tests don't
+push the global counter past the navigation-overuse threshold (15) and
+contaminate `test_query_api::test_navigation_hints_*` in the full suite.
+
+## v4.4.0 — Chain nudges + ts_search warm-up + set_project_root nudge (2026-05-26)
+
+Driven by an audit of 9 days of usage (2026-05-17..26, 869 tool calls).
+
+**Chain nudges (server.py):** Data showed 42 `find_symbol(X) -> get_function_source(X)`
+and 26 `find_symbol(X) -> get_full_context(X)` same-symbol chains within 60s,
+plus 258 `search_codebase -> get_function_source` chains. Trailing `_hints`
+were ignored. Now when `get_function_source`/`get_class_source`/`get_dependents`/
+`get_dependencies` is called on a symbol that was passed to `find_symbol`
+within the previous 60s, the response is prepended with a `[NUDGE]` block
+suggesting `get_full_context(X)`. Top-of-payload so it survives output
+compression. Opt out via `TOKEN_SAVIOR_CHAIN_NUDGE=0`.
+
+**ts_search warm-up (server_handlers/tool_search.py + server.py):** Data
+showed `ts_search` avg **4867ms** over 19 calls -- the Nomic cold start +
+66 tool description embeddings dominate the first call. New `warm_up_async()`
+fires a background thread at server startup so the first client `ts_search`
+sees a populated cache. Opt out via `TOKEN_SAVIOR_NO_WARMUP=1`.
+
+**set_project_root nudge (server_handlers/project.py):** When the cheap
+path fires (project already registered via `WORKSPACE_ROOTS`), the response
+now prepends `[NUDGE] Use switch_project('name') next time` so the agent
+self-corrects toward the documented entry point.
+
+## v4.3.3 — Fix MCP `CallToolResult` validation regression (#32) (2026-05-26)
+
+Hotfix for a regression introduced in v3.5.0 with the `_compat.py` shim.
+Every successful tool call was returning `isError=True` with five
+`CallToolResult` pydantic validation errors. Reported by @zinkovsky in #32.
+
+Root cause: `list_tools()` converted shim `ToolDef` -> `mcp.types.Tool` at
+the protocol boundary, but `call_tool()` returned shim `TextContent`
+instances unconverted. pydantic v2 rejects the shim on `CallToolResult`
+validation (same class name, different class object).
+
+Fix: introduce `_to_mcp_content()` in `server.py` that converts shim
+items to real `mcp.types.TextContent` at the boundary. Symmetric with
+the `list_tools` conversion. Cold-start cost preserved -- the import
+stays lazy (server-only path, never hit by the CLI fork-mode consumers
+the shim was built for).
+
+Test gap closed: every prior `call_tool` integration test inspected the
+returned list directly, never going through the SDK's pydantic
+validation step. New `tests/test_issue_32_mcp_textcontent.py` builds a
+real `CallToolResult` from the value `call_tool` returns -- catches any
+future shim leak on the success path, the error path, and the meta-tool
+paths (`ts_search`, `ts_extended`).
+
 ## v4.3.2 — `ts init` next-steps hint (2026-05-19)
 
 After a successful `ts init`, the CLI now prints a short "Next steps"

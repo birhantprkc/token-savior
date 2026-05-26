@@ -525,7 +525,66 @@ def _track_call(name: str, arguments: dict[str, Any]) -> str:
         if cached is not None:
             s._spec_branches_hit += 1
             s._spec_tokens_saved += len(cached) // 4
+
+    # Chain-nudge buffer (see server_state._chain_calls for rationale).
+    # Push every call so the nudge detector can match on (prev_tool, prev_sym).
+    if not s._CHAIN_NUDGE_DISABLED:
+        s._chain_calls.append((time.monotonic(), name, record_symbol or ""))
+
     return record_symbol
+
+
+# ---------------------------------------------------------------------------
+# Chain-nudge: top-of-payload notice when a known wasteful pattern is detected.
+# Data (2026-05-17..26): 42 find_symbol -> get_function_source same-symbol
+# chains and 26 find_symbol -> get_full_context within 60s, all foldable.
+# Trailing _hints are ignored in practice; this notice is prepended so it
+# lands above any compressed payload.
+# ---------------------------------------------------------------------------
+_CHAIN_WINDOW_SEC = 60.0
+
+
+_CHAIN_READ_AFTER_FIND = ("get_function_source", "get_class_source", "get_dependents", "get_dependencies")
+_CHAIN_PREV_FIND = ("find_symbol",)
+_CHAIN_PREV_READ = ("get_function_source", "get_class_source")
+
+
+def _detect_chain_nudge(name: str, symbol: str) -> str | None:
+    if s._CHAIN_NUDGE_DISABLED or not symbol:
+        return None
+    now = time.monotonic()
+    for ts, prev_tool, prev_sym in reversed(s._chain_calls):
+        if now - ts > _CHAIN_WINDOW_SEC:
+            break
+        if prev_sym != symbol:
+            continue
+        # Pattern 1: find_symbol(X) -> get_function_source/etc(X) within 60s.
+        # 9-day data: 42 occurrences. Both calls fold into one get_full_context.
+        if name in _CHAIN_READ_AFTER_FIND and prev_tool in _CHAIN_PREV_FIND:
+            return (
+                f"[NUDGE] You called find_symbol('{symbol}') then {name}('{symbol}') "
+                f"on the same symbol. Next time use get_full_context('{symbol}') "
+                f"-- one round-trip returns location + source + callers + deps."
+            )
+        # Pattern 2: get_function_source/get_class_source(X) -> get_full_context(X)
+        # within 60s. 9-day data: 187 occurrences. Source is re-fetched as part
+        # of get_full_context, so the first read was wasted.
+        if name == "get_full_context" and prev_tool in _CHAIN_PREV_READ:
+            return (
+                f"[NUDGE] You called {prev_tool}('{symbol}') then "
+                f"get_full_context('{symbol}'). The source was re-fetched. "
+                f"Start with get_full_context('{symbol}') next time -- it returns "
+                f"source + callers + deps in one call."
+            )
+    return None
+
+
+def _prepend_nudge(result: list, nudge: str) -> list:
+    if not nudge or not result:
+        return result
+    s._chain_nudges_emitted += 1
+    notice = TextContent(type="text", text=nudge)
+    return [notice, *result]
 
 
 def _maybe_auto_save_findings():
@@ -759,6 +818,25 @@ async def _handle_ts_execute(arguments: dict[str, Any]) -> list[types.TextConten
 _TRACE_REQUESTS = os.environ.get("TOKEN_SAVIOR_TRACE", "").lower() in ("1", "true", "yes")
 
 
+def _to_mcp_content(items: list) -> list:
+    # Convert shim TextContent (_compat) to real mcp.types.TextContent at the
+    # protocol boundary. Handlers return shim instances for cold-start reasons;
+    # the SDK's CallToolResult pydantic v2 model only accepts the real class.
+    # Same-name-different-class -> ValidationError -> every call reports
+    # isError=True. See issue #32 (broken 3.5.0..4.3.2).
+    from mcp.types import TextContent as _McpText
+    out = []
+    for it in items:
+        if isinstance(it, _McpText):
+            out.append(it)
+            continue
+        out.append(_McpText(
+            type=getattr(it, "type", "text"),
+            text=getattr(it, "text", str(it)),
+        ))
+    return out
+
+
 async def call_tool(name: str, arguments: dict[str, Any]) -> list:
 
     # Latency instrumentation: always record, regardless of TOKEN_SAVIOR_TRACE.
@@ -779,6 +857,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list:
             result = await _handle_ts_execute(arguments)
         else:
             result = _dispatch_tool(name, arguments, record_symbol)
+        nudge = _detect_chain_nudge(name, record_symbol)
+        if nudge:
+            result = _prepend_nudge(result, nudge)
         if _TRACE_REQUESTS:
             elapsed_ms = (time.monotonic() - _lat_start) * 1000.0
             print(
@@ -786,7 +867,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list:
                 file=sys.stderr,
                 flush=True,
             )
-        return result
+        return _to_mcp_content(result)
 
     except Exception as e:
         _lat_status = "err"
@@ -799,7 +880,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list:
                 flush=True,
             )
         print(f"[token-savior] Error in {name}: {traceback.format_exc()}", file=sys.stderr)
-        return [TextContent(type="text", text=f"Error: {e}")]
+        return _to_mcp_content([TextContent(type="text", text=f"Error: {e}")])
 
     finally:
         # Fire-and-forget persistence. The latency module is silent on
@@ -826,6 +907,16 @@ async def main():
     if _TRACE_REQUESTS:
         print("[token-savior] startup: running memory migrations", file=sys.stderr, flush=True)
     memory_db.run_migrations()
+    # Warm the tool-description embedding cache in a background thread so the
+    # first ts_search call from the client doesn't pay the Nomic cold start.
+    # 9 days of usage measured avg 4.8s on ts_search; cold load dominates.
+    # Skippable via TOKEN_SAVIOR_NO_WARMUP=1 for resource-constrained hosts.
+    if os.environ.get("TOKEN_SAVIOR_NO_WARMUP", "").lower() not in ("1", "true", "yes"):
+        try:
+            from token_savior.server_handlers.tool_search import warm_up_async
+            warm_up_async()
+        except Exception:
+            pass
     if _TRACE_REQUESTS:
         print("[token-savior] startup: opening stdio transport", file=sys.stderr, flush=True)
     # Lazy : Server() instancie ici, applique les decorateurs sur nos
