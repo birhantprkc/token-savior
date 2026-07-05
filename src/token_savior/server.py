@@ -491,6 +491,16 @@ def _track_call(name: str, arguments: dict[str, Any]) -> str:
 
     if name == "switch_project":
         _maybe_auto_save_findings()
+        # Fold the symbols touched since the last switch into the co-activation
+        # tensor. Without this flush, record_activation only ever filled the
+        # in-memory session buffer and flush_session was never called, so
+        # session_count stayed 0 for the whole deployment (audit 2026-07-04:
+        # "TCA co-activation: 0 sessions, DEAD"). switch_project is the natural
+        # session-segment boundary; an atexit flush (server.main) catches the last.
+        try:
+            s._tca_engine.flush_session()
+        except Exception:
+            pass
         s._auto_save_project = s._slot_mgr.active_root
         s._auto_save_symbols.clear()
         s._auto_save_tools.clear()
@@ -548,34 +558,115 @@ _CHAIN_READ_AFTER_FIND = ("get_function_source", "get_class_source", "get_depend
 _CHAIN_PREV_FIND = ("find_symbol",)
 _CHAIN_PREV_READ = ("get_function_source", "get_class_source")
 
+# Pattern 3: edit tools that should be preceded by get_edit_context.
+_EDIT_TOOLS_NEEDING_CONTEXT = (
+    "replace_symbol_source",
+    "insert_near_symbol",
+    "add_field_to_model",
+    "move_symbol",
+)
+
+# Pattern 4: individual navigation calls foldable into one ts_execute script.
+_NAV_CHAIN_TOOLS = (
+    "find_symbol",
+    "get_function_source",
+    "get_class_source",
+    "get_full_context",
+    "get_dependents",
+    "get_dependencies",
+    "search_codebase",
+    "get_structure_summary",
+)
+_TS_EXECUTE_NUDGE_THRESHOLD = 5
+
+
+def _safe_flush_tca() -> None:
+    """Best-effort flush of the TCA co-activation buffer (used at exit)."""
+    try:
+        s._tca_engine.flush_session()
+    except Exception:
+        pass
+
+
+def _fire_nudge(kind: str, text: str) -> str:
+    """Persist a nudge fire (for effectiveness auditing) and return its text."""
+    try:
+        from token_savior import telemetry
+        telemetry.record_nudge(kind)
+    except Exception:
+        pass
+    return text
+
 
 def _detect_chain_nudge(name: str, symbol: str) -> str | None:
-    if s._CHAIN_NUDGE_DISABLED or not symbol:
+    if s._CHAIN_NUDGE_DISABLED:
         return None
     now = time.monotonic()
-    for ts, prev_tool, prev_sym in reversed(s._chain_calls):
-        if now - ts > _CHAIN_WINDOW_SEC:
-            break
-        if prev_sym != symbol:
-            continue
-        # Pattern 1: find_symbol(X) -> get_function_source/etc(X) within 60s.
-        # 9-day data: 42 occurrences. Both calls fold into one get_full_context.
-        if name in _CHAIN_READ_AFTER_FIND and prev_tool in _CHAIN_PREV_FIND:
-            return (
-                f"[NUDGE] You called find_symbol('{symbol}') then {name}('{symbol}') "
-                f"on the same symbol. Next time use get_full_context('{symbol}') "
-                f"-- one round-trip returns location + source + callers + deps."
-            )
-        # Pattern 2: get_function_source/get_class_source(X) -> get_full_context(X)
-        # within 60s. 9-day data: 187 occurrences. Source is re-fetched as part
-        # of get_full_context, so the first read was wasted.
-        if name == "get_full_context" and prev_tool in _CHAIN_PREV_READ:
-            return (
-                f"[NUDGE] You called {prev_tool}('{symbol}') then "
-                f"get_full_context('{symbol}'). The source was re-fetched. "
-                f"Start with get_full_context('{symbol}') next time -- it returns "
-                f"source + callers + deps in one call."
-            )
+
+    # Pattern 3: edit tool called without a preceding get_edit_context on the
+    # same symbol. Audit 2026-07-04: 0 get_edit_context calls across ~199 edits
+    # (replace_symbol_source 156 + add_field_to_model 28 + insert_near_symbol 15).
+    # get_edit_context returns source + callers + deps + siblings + tests in one
+    # call -- editing blind risks breaking a caller the agent never looked at.
+    if symbol and name in _EDIT_TOOLS_NEEDING_CONTEXT:
+        saw_context = False
+        for ts, prev_tool, prev_sym in reversed(s._chain_calls):
+            if now - ts > _CHAIN_WINDOW_SEC:
+                break
+            if prev_tool == "get_edit_context" and prev_sym == symbol:
+                saw_context = True
+                break
+        if not saw_context:
+            return _fire_nudge("edit_context", (
+                f"[NUDGE] You're editing '{symbol}' without calling "
+                f"get_edit_context('{symbol}') first. It returns source + callers + "
+                f"deps + siblings + impacted tests in one call, so you don't break a "
+                f"caller you never saw."
+            ))
+
+    if symbol:
+        for ts, prev_tool, prev_sym in reversed(s._chain_calls):
+            if now - ts > _CHAIN_WINDOW_SEC:
+                break
+            if prev_sym != symbol:
+                continue
+            # Pattern 1: find_symbol(X) -> get_function_source/etc(X) within 60s.
+            # 9-day data: 42 occurrences. Both calls fold into one get_full_context.
+            if name in _CHAIN_READ_AFTER_FIND and prev_tool in _CHAIN_PREV_FIND:
+                return _fire_nudge("find_then_read", (
+                    f"[NUDGE] You called find_symbol('{symbol}') then {name}('{symbol}') "
+                    f"on the same symbol. Next time use get_full_context('{symbol}') "
+                    f"-- one round-trip returns location + source + callers + deps."
+                ))
+            # Pattern 2: get_function_source/get_class_source(X) -> get_full_context(X)
+            # within 60s. 9-day data: 187 occurrences. Source is re-fetched as part
+            # of get_full_context, so the first read was wasted.
+            if name == "get_full_context" and prev_tool in _CHAIN_PREV_READ:
+                return _fire_nudge("read_then_full_context", (
+                    f"[NUDGE] You called {prev_tool}('{symbol}') then "
+                    f"get_full_context('{symbol}'). The source was re-fetched. "
+                    f"Start with get_full_context('{symbol}') next time -- it returns "
+                    f"source + callers + deps in one call."
+                ))
+
+    # Pattern 4: many individual nav calls in one window -> Code Mode.
+    # Audit 2026-07-04: ts_execute used only 41x despite thousands of unitary
+    # nav calls. Anthropic's "code execution with MCP" shows chained tool calls
+    # fold into one script (up to -98.7% tokens). Fire once, when the count
+    # crosses the threshold, to avoid nudging on every subsequent call.
+    if name in _NAV_CHAIN_TOOLS:
+        nav_in_window = sum(
+            1 for ts, tool, _ in s._chain_calls
+            if now - ts <= _CHAIN_WINDOW_SEC and tool in _NAV_CHAIN_TOOLS
+        )
+        if nav_in_window == _TS_EXECUTE_NUDGE_THRESHOLD:
+            return _fire_nudge("ts_execute", (
+                f"[NUDGE] {nav_in_window} separate navigation calls in the last minute. "
+                f"ts_execute runs a JS script calling many tools in one round-trip "
+                f"(await tools.get_full_context(...), etc.) -- collapses the chain and "
+                f"cuts tokens. Consider it for multi-step exploration."
+            ))
+
     return None
 
 
@@ -706,6 +797,15 @@ def _dispatch_tool(name: str, arguments: dict[str, Any], record_symbol: str) -> 
     return [TextContent(type="text", text=f"Error: unknown tool '{name}'")]
 
 
+def _local_embed_model_cold() -> bool:
+    """True when the in-process Nomic model has not been loaded yet."""
+    try:
+        from token_savior.memory import embeddings as _emb
+        return getattr(_emb, "_model", None) is None
+    except Exception:
+        return True
+
+
 def _handle_ts_search(arguments: dict[str, Any]) -> list[types.TextContent]:
     """Defer-loading router: cosine-sim over Nomic tool description embeddings.
 
@@ -715,6 +815,26 @@ def _handle_ts_search(arguments: dict[str, Any]) -> list[types.TextContent]:
     excluded (e.g. capture_* under TS_CAPTURE_DISABLED=1).
     """
     import json as _json
+
+    # Cold-start bridge (opt-in via TS_SEARCH_COLD_DELEGATE=1): the in-process
+    # model load costs ~5s on a fresh stdio spawn (audit 2026-07-04: ts_search
+    # p50 5723ms). If the local model isn't warm yet and a persistent daemon is
+    # reachable, delegate this one call to the daemon's already-warm model. The
+    # startup warm_up thread keeps loading in the background, so subsequent
+    # calls run in-process. Any daemon failure falls through to the local path.
+    if s._TS_SEARCH_COLD_DELEGATE and _local_embed_model_cold():
+        from token_savior import daemon_client
+        text = daemon_client.call_daemon(
+            "ts_search",
+            {
+                "query": arguments.get("query") or "",
+                "top_k": arguments.get("top_k", 5),
+                "include_schema": arguments.get("include_schema", True),
+            },
+        )
+        if text:
+            return [TextContent(type="text", text=text)]
+
     visible = {t.name for t in TOOLS}
     fmt = arguments.get("format")
     if fmt is None and _PROFILE == "code_mode":
@@ -907,6 +1027,10 @@ async def main():
     if _TRACE_REQUESTS:
         print("[token-savior] startup: running memory migrations", file=sys.stderr, flush=True)
     memory_db.run_migrations()
+    # Persist the final co-activation segment when the server exits, so the last
+    # session's touched symbols aren't lost (switch_project flushes mid-session).
+    import atexit
+    atexit.register(lambda: _safe_flush_tca())
     # Warm the tool-description embedding cache in a background thread so the
     # first ts_search call from the client doesn't pay the Nomic cold start.
     # 9 days of usage measured avg 4.8s on ts_search; cold load dominates.
@@ -927,6 +1051,24 @@ async def main():
     server = s.get_server()
     server.list_tools()(list_tools)
     server.call_tool()(call_tool)
+
+    # Observations as ts://obs/{id} resources (opt-out: TS_RESOURCES_DISABLED=1).
+    if os.environ.get("TS_RESOURCES_DISABLED", "").lower() not in ("1", "true", "yes"):
+        try:
+            from token_savior.server_handlers import resources as _res
+
+            @server.list_resources()
+            async def _ts_list_resources():
+                try:
+                    return _res.list_observation_resources()
+                except Exception:
+                    return []
+
+            @server.read_resource()
+            async def _ts_read_resource(uri):
+                return _res.read_observation_resource(uri)
+        except Exception:
+            pass
     async with stdio_server() as (read_stream, write_stream):
         if _TRACE_REQUESTS:
             print("[token-savior] startup: server.run loop entered", file=sys.stderr, flush=True)

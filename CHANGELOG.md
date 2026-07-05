@@ -1,5 +1,124 @@
 # Changelog
 
+## v4.8.0 — Observations as MCP resources (2026-07-04)
+
+Formalises the `ts://obs/{id}` scheme (already printed by memory_index) as real
+MCP resources, so clients that support resource `@`-mentions (Claude Code) can
+pull a specific stored memory without a tool round-trip.
+
+- `server_handlers/resources.py`: `list_observation_resources()` (bounded, ranked
+  by the memory_index score) and `read_observation_resource(uri)`.
+- Wired in `server.main()` via `list_resources`/`read_resource` handlers,
+  opt-out with `TS_RESOURCES_DISABLED=1`. Read-only and additive -- the tool
+  dispatch path is untouched.
+
+Tests: test_resources.py (read roundtrip, bad/missing URIs, list scoping).
+Suite: 1792 passed.
+
+## v4.7.0 — Self-audit, nudge telemetry, TCA revival, warm-daemon delegation (2026-07-04)
+
+Closes the loop the v4.4→v4.6 passes exposed: fixes were shipped but never
+measured (and, it turned out, never even deployed -- see v4.6 notes). This adds
+the instrumentation to know whether they work, and fixes a silently-dead ML path.
+
+**Automated usage audit (scripts/ts_audit.py).** Reproduces the manual
+memory.db + tool-calls.json dig as a one-shot report: per-tool latency p50/p95,
+wasteful chains (tool-level, 60s), adoption gaps (edits without get_edit_context,
+nav bursts vs ts_execute, set_project_root churn), nudge fires, and ML liveness.
+Re-run after a deploy to see whether behaviour moved. Baseline 2026-07-04
+confirmed get_edit_context 0/207, TCA dead, ts_search p50 4564ms.
+
+**Persistent nudge telemetry (telemetry.py + server.py).** Each chain-nudge
+fire is now counted by kind in `nudge-stats.json` (`record_nudge`/`nudge_counts`).
+Effectiveness = nudge fires here vs the target tool's rise in tool-calls.json
+over successive audits.
+
+**TCA co-activation revival (server.py + tca_engine.py).** The audit found TCA
+`session_count` stuck at 0 for the whole deployment: `record_activation` filled
+the in-session buffer but `flush_session` was never called, so the co-activation
+tensor stayed empty and `get_coactive_symbols` always returned []. Now flushed at
+each switch_project boundary and via an atexit hook. Not dead code to cut -- a
+broken feature now made live.
+
+**Warm-daemon ts_search delegation, actually enabled (ts-daemon.service).** v4.6
+built the delegation but the daemon ran system python without fastembed
+(substring only). The unit now launches the venv python (fastembed present), so
+delegated ts_search returns embedding quality warm: measured 1505ms cold model
+load then **23ms warm** (vs ~1.5-5.7s in-process per client spawn).
+
+Tests: test_nudge_telemetry.py, test_tca_flush_wiring.py. Suite: 1786 passed.
+
+## v4.6.0 — ts_search cold-start bridge via the warm daemon (2026-07-04)
+
+Delivers the follow-up flagged in v4.5.0: the in-process Nomic model load costs
+~5s on a fresh stdio spawn (audit: ts_search p50 5723ms). v4.5.0 removed the
+tool-description re-embed; this closes the remaining half -- the query
+embedding.
+
+**Cold-start delegation (server.py + daemon_client.py + cli.py).** When
+`TS_SEARCH_COLD_DELEGATE=1` and the in-process model is still cold, the first
+`ts_search` is delegated over the Unix socket to a running `ts _daemon-serve`,
+which keeps the Nomic model warm across sessions (measured ~130ms warm vs
+~5700ms in-process cold). The startup warm-up thread keeps loading locally, so
+subsequent calls run in-process. Any daemon failure (no socket, timeout, error)
+falls through to the unchanged local path -- opt-in and safe by default (most
+installs have no daemon).
+
+- `daemon_client.call_daemon()`: minimal length-prefixed-JSON socket client,
+  best-effort (returns None on any failure).
+- `cli._daemon_serve`: the daemon's `call` handler now routes `ts_search`
+  through `_handle_ts_search` (it is special-cased in `call_tool`, not a
+  regular dispatched tool, so `_dispatch_tool` returned "unknown tool").
+
+Tests: test_daemon_client.py (real Unix-socket server), test_ts_search_cold_delegate.py
+(delegate/fallback matrix). Suite: 1779 passed.
+
+## v4.5.0 — Adoption-gap pass driven by 5.5-week usage audit (2026-07-04)
+
+Audit of ~7 weeks of real usage (tool-calls.json + memory.db `tool_latency`
+1414 rows) surfaced four adoption/latency gaps the v4.4 nudges did not close.
+
+**set_project_root churn (server_handlers/project.py + slot_manager.py).**
+Measured 51 `set_project_root` calls in 5.5 weeks (≈ as many as switch_project),
+p95 1.8s with one 14.6s outlier; `collector-crypt-scanner` reindexed 20x. Root
+cause: the in-memory registry was rebuilt from the static `WORKSPACE_ROOTS` env
+on every stdio respawn, so a project registered via set_project_root vanished
+next session and got fully rebuilt again. Fixes:
+- Registered roots now persist to `<stats>/registered_projects.json`
+  (`_persist_registered_root` / `_load_registered_roots`, atomic, best-effort).
+- `switch_project` resolves an unknown hint against a real directory path or a
+  persisted project by basename (`_resolve_unregistered`), registering it
+  cache-aware -- the agent no longer needs set_project_root across sessions.
+- `set_project_root` is now cache-aware: the non-force path uses `ensure()`
+  (reuses the on-disk index when the git ref matches) instead of the
+  unconditional `build()` that paid the 14.6s rebuild every session.
+  `force=true` still does a full rebuild.
+
+**get_edit_context nudge (server.py, chain-nudge pattern 3).** Audit: 0
+`get_edit_context` calls across ~199 edits (replace_symbol_source 156 +
+add_field_to_model 28 + insert_near_symbol 15). Editing a symbol without the
+pre-edit bundle now prepends a `[NUDGE]` pointing at get_edit_context.
+
+**ts_execute nudge (server.py, chain-nudge pattern 4).** Audit: ts_execute
+used only 41x despite thousands of unitary nav calls. When 5 individual
+navigation calls land in one 60s window, a `[NUDGE]` suggests folding them into
+one Code Mode script. Fires once at the threshold.
+
+**ts_search cold-start (server_handlers/tool_search.py).** p50 still 5723ms
+despite the v4.4 warm-up (the thread loses the race in stdio mode). Tool-
+description embeddings now persist to `<stats>/tool_embeddings.json`, keyed by a
+content+model signature, so cold start skips re-embedding all ~66 descriptions.
+(The Nomic model load for the query stays in-process; routing that through the
+warm ts-daemon is a documented follow-up.)
+
+**Hook log noise (hooks/memory-session-stop.sh).** A clean no-observations
+close no longer prints to stderr -- it had appended 3578 benign lines to
+hook-errors.log.
+
+All 6 changes shipped with tests (test_registered_persistence.py,
+test_tool_embed_disk_cache.py, TestEditContextNudge/TestTsExecuteNudge in
+test_chain_nudge.py). Suite: 1771 passed.
+
 ## v4.4.1 — Chain nudge covers get_function_source -> get_full_context (2026-05-26)
 
 Extend the chain-nudge detector to cover the dominant remaining wasteful
